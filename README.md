@@ -11,6 +11,7 @@ This fork ([khimaros/qwen3-tts.cpp](https://github.com/khimaros/qwen3-tts.cpp)) 
 - **Proper UTF-8 tokenization** via GPT-2 regex pre-tokenization (fixes tokenization of non-ASCII text)
 - **WAVE_FORMAT_EXTENSIBLE** WAV header support (e.g. macOS screen recordings)
 - **GPU-safe vocoder codebook normalization** (unbreaks Vulkan backend)
+- **Performance optimizations**: flash attention for decode steps, static KV cache with `ggml_set_rows`, cached vocoder decoder graph
 
 The rest of this README is the original from upstream.
 
