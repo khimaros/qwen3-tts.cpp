@@ -42,6 +42,8 @@ endif()
 # Text tokenizer library
 add_library(text_tokenizer STATIC
     src/text_tokenizer.cpp
+    src/tokenizer_unicode.cpp
+    src/tokenizer_unicode_data.cpp
     src/gguf_loader.cpp
 )
 target_include_directories(text_tokenizer PUBLIC
@@ -124,6 +126,29 @@ if(GGML_HAS_METAL)
     target_link_libraries(audio_tokenizer_encoder PUBLIC ggml-metal "-framework Metal" "-framework MetalKit")
 endif()
 
+# Audio codec encoder library (Mimi encoder for ICL voice cloning)
+add_library(audio_codec_encoder STATIC
+    src/audio_codec_encoder.cpp
+    src/gguf_loader.cpp
+)
+target_include_directories(audio_codec_encoder PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${GGML_DIR}/include
+)
+target_link_directories(audio_codec_encoder PUBLIC
+    ${GGML_BUILD_DIR}/src
+    ${GGML_BUILD_DIR}/src/ggml-metal
+)
+target_link_libraries(audio_codec_encoder PUBLIC
+    ggml
+    ggml-base
+    ggml-cpu
+    Threads::Threads
+)
+if(GGML_HAS_METAL)
+    target_link_libraries(audio_codec_encoder PUBLIC ggml-metal "-framework Metal" "-framework MetalKit")
+endif()
+
 # Audio tokenizer decoder library (GGML-based)
 add_library(audio_tokenizer_decoder STATIC
     src/audio_tokenizer_decoder.cpp
@@ -159,6 +184,7 @@ target_link_libraries(qwen3_tts PUBLIC
     text_tokenizer
     tts_transformer
     audio_tokenizer_encoder
+    audio_codec_encoder
     audio_tokenizer_decoder
     Threads::Threads
 )
@@ -224,7 +250,7 @@ target_link_libraries(test_decoder PRIVATE
 )
 
 # Install targets
-install(TARGETS text_tokenizer tts_transformer audio_tokenizer_encoder audio_tokenizer_decoder qwen3_tts qwen3tts_shared qwen3-tts-cli
+install(TARGETS text_tokenizer tts_transformer audio_tokenizer_encoder audio_codec_encoder audio_tokenizer_decoder qwen3_tts qwen3tts_shared qwen3-tts-cli
     ARCHIVE DESTINATION lib
     LIBRARY DESTINATION lib
     RUNTIME DESTINATION bin
@@ -235,6 +261,7 @@ install(FILES
     src/tts_transformer.h
     src/coreml_code_predictor.h
     src/audio_tokenizer_encoder.h
+    src/audio_codec_encoder.h
     src/audio_tokenizer_decoder.h
     src/qwen3_tts.h
     src/qwen3tts_c_api.h

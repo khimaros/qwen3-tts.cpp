@@ -55,9 +55,18 @@ bool read_wav_file(const std::string & path, std::vector<float> & samples, int &
             fread(&sr, 4, 1, f);
             fseek(f, 6, SEEK_CUR);  // Skip byte rate and block align
             fread(&bits_per_sample, 2, 1, f);
-            
-            // Skip any extra format bytes
-            if (chunk_size > 16) {
+
+            // Handle WAVE_FORMAT_EXTENSIBLE: read actual format from SubFormat GUID
+            if (audio_format == 0xFFFE && chunk_size >= 40) {
+                fseek(f, 8, SEEK_CUR);  // Skip cbSize(2) + validBitsPerSample(2) + channelMask(4)
+                uint16_t sub_format = 0;
+                fread(&sub_format, 2, 1, f);
+                audio_format = sub_format;
+                // Skip remaining SubFormat GUID bytes and any extra data
+                fseek(f, chunk_size - 26, SEEK_CUR);
+            }
+            // Skip any extra format bytes for non-extensible formats
+            else if (chunk_size > 16) {
                 fseek(f, chunk_size - 16, SEEK_CUR);
             }
         }

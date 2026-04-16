@@ -1,4 +1,5 @@
 #include "text_tokenizer.h"
+#include "tokenizer_unicode.h"
 
 #include <algorithm>
 #include <cstring>
@@ -6,6 +7,10 @@
 #include <sstream>
 
 namespace qwen3_tts {
+
+static const std::vector<std::string> GPT2_REGEX_EXPRS = {
+    "'s|'t|'re|'ve|'m|'ll|'d| ?\\p{L}+| ?\\p{N}+| ?[^\\s\\p{L}\\p{N}]+|\\s+(?!\\S)",
+};
 
 // GPT-2 byte-to-unicode mapping
 // Maps bytes 0-255 to unicode characters to avoid control characters
@@ -150,10 +155,14 @@ bool TextTokenizer::load_from_gguf(struct gguf_context * ctx) {
     
     assistant_token_id_ = find_token("assistant");
     if (assistant_token_id_ < 0) {
-        // Try with space prefix (GPT-2 style)
         assistant_token_id_ = find_token("Ġassistant");
     }
-    
+
+    user_token_id_ = find_token("user");
+    if (user_token_id_ < 0) {
+        user_token_id_ = find_token("Ġuser");
+    }
+
     // Newline token
     newline_token_id_ = find_token("Ċ");  // GPT-2 encoding for '\n'
     if (newline_token_id_ < 0) {
@@ -238,35 +247,17 @@ std::vector<int32_t> TextTokenizer::encode(const std::string & text) const {
     
     std::vector<int32_t> tokens;
     
-    // Convert text to GPT-2 unicode representation
-    std::string unicode_text = bytes_to_unicode(text);
-    
-    // Simple word splitting (no regex pre-tokenization for now)
-    // Split on spaces but keep the space with the following word (GPT-2 style)
-    std::vector<std::string> words;
-    std::string current_word;
-    
-    size_t i = 0;
-    while (i < unicode_text.size()) {
-        size_t len = utf8_len(unicode_text[i]);
-        std::string ch = unicode_text.substr(i, len);
-        
-        // Check if this is a space (Ġ in GPT-2 encoding)
-        if (ch == "Ġ") {
-            if (!current_word.empty()) {
-                words.push_back(current_word);
-                current_word.clear();
-            }
-            current_word = ch;  // Start new word with space
-        } else {
-            current_word += ch;
-        }
-        i += len;
+    // handle special tokens directly
+    if (text == "<|im_start|>") return {config_.bos_token_id};
+    if (text == "<|im_end|>")   return {config_.eos_token_id};
+    if (text == "<|im_pad|>")   return {config_.pad_token_id};
+
+    // GPT-2 regex pre-tokenization (proper unicode-aware splitting)
+    std::vector<std::string> words = unicode_regex_split(text, GPT2_REGEX_EXPRS);
+    if (words.empty() && !text.empty()) {
+        words.push_back(bytes_to_unicode(text));
     }
-    if (!current_word.empty()) {
-        words.push_back(current_word);
-    }
-    
+
     // BPE encode each word
     for (const auto & word : words) {
         auto bpe_tokens = bpe(word);
@@ -275,18 +266,41 @@ std::vector<int32_t> TextTokenizer::encode(const std::string & text) const {
             if (it != vocab_.end()) {
                 tokens.push_back(it->second);
             } else {
-                // Unknown token - encode as bytes
-                for (unsigned char c : tok) {
-                    std::string byte_tok = BYTE_TO_UNICODE[c];
+                // unknown token - fall back to byte-level pieces
+                size_t pos = 0;
+                while (pos < tok.size()) {
+                    size_t len = utf8_len(tok[pos]);
+                    std::string byte_tok = tok.substr(pos, len);
                     auto byte_it = vocab_.find(byte_tok);
                     if (byte_it != vocab_.end()) {
                         tokens.push_back(byte_it->second);
                     }
+                    pos += len;
                 }
             }
         }
     }
-    
+
+    return tokens;
+}
+
+std::vector<int32_t> TextTokenizer::encode_instruct(const std::string & instruct) const {
+    if (!loaded_ || instruct.empty()) {
+        return {};
+    }
+
+    // Format: <|im_start|>user\n{instruct}<|im_end|>\n
+    std::vector<int32_t> tokens;
+    tokens.push_back(config_.bos_token_id);
+    tokens.push_back(user_token_id_);
+    tokens.push_back(newline_token_id_);
+
+    auto text_tokens = encode(instruct);
+    tokens.insert(tokens.end(), text_tokens.begin(), text_tokens.end());
+
+    tokens.push_back(config_.eos_token_id);
+    tokens.push_back(newline_token_id_);
+
     return tokens;
 }
 
@@ -294,7 +308,7 @@ std::vector<int32_t> TextTokenizer::encode_for_tts(const std::string & text) con
     if (!loaded_) {
         return {};
     }
-    
+
     // Format: <|im_start|>assistant\n{text}<|im_end|>\n<|im_start|>assistant\n
     std::vector<int32_t> tokens;
     

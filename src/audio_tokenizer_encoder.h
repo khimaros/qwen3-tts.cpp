@@ -125,8 +125,12 @@ public:
     }
     
     const speaker_encoder_config & get_config() const { return model_.config; }
-    
+
     const std::string & get_error() const { return error_msg_; }
+
+    // Set abort callback checked before each graph compute (thread-safe)
+    void set_abort_callback(ggml_abort_callback callback, void * data);
+    bool is_aborted() const;
     
 private:
     // Compute mel spectrogram from waveform
@@ -139,6 +143,8 @@ private:
     speaker_encoder_model model_;
     speaker_encoder_state state_;
     std::string error_msg_;
+    ggml_abort_callback abort_cb_ = nullptr;
+    void * abort_data_ = nullptr;
 };
 
 // Free model resources

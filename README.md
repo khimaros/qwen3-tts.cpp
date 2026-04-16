@@ -1,5 +1,21 @@
 # qwen3-tts.cpp
 
+## Added In This Fork
+
+This fork ([khimaros/qwen3-tts.cpp](https://github.com/khimaros/qwen3-tts.cpp)) layers the following on top of [predict-woo/qwen3-tts.cpp](https://github.com/predict-woo/qwen3-tts.cpp):
+
+- **1.7B model support** with MTP projection bridging the 2048-dim talker and 1024-dim code predictor, plus dynamic model detection
+- **ICL voice cloning** via Mimi codec encoder — reference audio is encoded to discrete speech codes and combined with `ref_text` in prefill, as an alternative to x-vector speaker embeddings
+- **Voice steering** via `--instructions` flag and server API (1.7B+ only)
+- **Multi-language synthesis** via `-l/--language` (en, zh, ja, ko, ru, de, fr, es, it, pt)
+- **Proper UTF-8 tokenization** via GPT-2 regex pre-tokenization (fixes tokenization of non-ASCII text)
+- **WAVE_FORMAT_EXTENSIBLE** WAV header support (e.g. macOS screen recordings)
+- **GPU-safe vocoder codebook normalization** (unbreaks Vulkan backend)
+
+The rest of this README is the original from upstream.
+
+---
+
 ![PyTorch vs qwen3-tts.cpp benchmark](./docs/benchmark_pytorch_vs_cpp.png)
 
 **Benchmark Snapshot (PyTorch vs qwen3-tts.cpp):** Basic 3.19x faster, Clone 4.07x faster. Peak RSS delta: Basic +19.0%, Clone +7.7%.

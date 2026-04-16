@@ -160,7 +160,11 @@ class AudioTokenizerDecoder {
 public:
     AudioTokenizerDecoder();
     ~AudioTokenizerDecoder();
-    
+
+    // Set abort callback checked before each graph compute (thread-safe)
+    void set_abort_callback(ggml_abort_callback callback, void * data);
+    bool is_aborted() const;
+
     // Load model from GGUF file (tokenizer model)
     bool load_model(const std::string & model_path);
 
@@ -219,11 +223,11 @@ private:
                                               int upsample_rate,
                                               int block_idx);
     
-    void normalize_codebooks();
-    
     audio_decoder_model model_;
     audio_decoder_state state_;
     std::string error_msg_;
+    ggml_abort_callback abort_cb_ = nullptr;
+    void * abort_data_ = nullptr;
     
     // Temporary storage for codes input
     std::vector<int32_t> codes_buf_;

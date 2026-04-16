@@ -73,6 +73,10 @@ def load_wav(path: str | Path) -> tuple[np.ndarray, int]:
     sample_rate = struct.unpack_from("<I", fmt_data, 4)[0]
     bits_per_sample = struct.unpack_from("<H", fmt_data, 14)[0]
 
+    # Handle WAVE_FORMAT_EXTENSIBLE: read actual format from SubFormat GUID
+    if audio_format == 0xFFFE and len(fmt_data) >= 40:
+        audio_format = struct.unpack_from("<H", fmt_data, 24)[0]
+
     if audio_format == 1:  # PCM
         if bits_per_sample == 16:
             samples = (

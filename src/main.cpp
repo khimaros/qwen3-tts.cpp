@@ -15,8 +15,9 @@ void print_usage(const char * program) {
     fprintf(stderr, "  --temperature <val>    Sampling temperature (default: 0.9, 0=greedy)\n");
     fprintf(stderr, "  --top-k <n>            Top-k sampling (default: 50, 0=disabled)\n");
     fprintf(stderr, "  --top-p <val>          Top-p sampling (default: 1.0)\n");
-    fprintf(stderr, "  --max-tokens <n>       Maximum audio tokens (default: 4096)\n");
+    fprintf(stderr, "  --max-tokens <n>       Maximum audio tokens (default: 2048)\n");
     fprintf(stderr, "  --repetition-penalty <val> Repetition penalty (default: 1.05)\n");
+    fprintf(stderr, "  -i, --instructions <s> Voice steering instructions\n");
     fprintf(stderr, "  -l, --language <lang>  Language: en,ru,zh,ja,ko,de,fr,es (default: en)\n");
     fprintf(stderr, "  -j, --threads <n>      Number of threads (default: 4)\n");
     fprintf(stderr, "  -h, --help             Show this help\n");
@@ -115,6 +116,12 @@ int main(int argc, char ** argv) {
                 fprintf(stderr, "Error: unknown language '%s'. Supported: en,ru,zh,ja,ko,de,fr,es,it,pt\n", lang.c_str());
                 return 1;
             }
+        } else if (arg == "-i" || arg == "--instructions") {
+            if (++i >= argc) {
+                fprintf(stderr, "Error: missing instructions value\n");
+                return 1;
+            }
+            params.instructions = argv[i];
         } else if (arg == "-j" || arg == "--threads") {
             if (++i >= argc) {
                 fprintf(stderr, "Error: missing threads value\n");

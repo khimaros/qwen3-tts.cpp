@@ -1,5 +1,6 @@
 #include "tts_transformer.h"
 #include "gguf_loader.h"
+#include "ggml-cpu.h"
 
 #include <cmath>
 #include <cstring>
@@ -157,6 +158,7 @@ bool TTSTransformer::load_model(const std::string & model_path) {
 }
 
 bool TTSTransformer::try_init_coreml_code_predictor(const std::string & model_path) {
+    (void)model_path;
     use_coreml_code_predictor_ = false;
     coreml_code_predictor_path_.clear();
 
@@ -289,6 +291,14 @@ bool TTSTransformer::parse_config(struct gguf_context * ctx) {
         "qwen3-tts.code_pred.vocab_size",
         "qwen3-tts.code_predictor.vocab_size",
     }, 2048);
+    cfg.code_pred_hidden_size = get_u32_any({
+        "qwen3-tts.code_pred.embedding_length",
+        "qwen3-tts.code_predictor.embedding_length",
+    }, 0);  // 0 = same as hidden_size
+    cfg.code_pred_intermediate_size = get_u32_any({
+        "qwen3-tts.code_pred.feed_forward_length",
+        "qwen3-tts.code_predictor.feed_forward_length",
+    }, 0);  // 0 = same as intermediate_size
 
     cfg.codec_pad_id = get_u32_any({
         "qwen3-tts.codec.pad_id",
@@ -339,13 +349,61 @@ bool TTSTransformer::parse_config(struct gguf_context * ctx) {
         "qwen3-tts.codec.language.english_id",
         "qwen3-tts.language_id",
     }, 2050);
-    
+
+    // model variant metadata
+    auto get_str = [&](const char * key, const char * default_val) -> std::string {
+        int64_t idx = gguf_find_key(ctx, key);
+        if (idx >= 0) return gguf_get_val_str(ctx, idx);
+        return default_val;
+    };
+    cfg.model_type = get_str("qwen3-tts.model_type", "base");
+    cfg.model_size = get_str("qwen3-tts.model_size", "");
+
+    // speaker encoder presence
+    cfg.has_speaker_encoder = (gguf_find_key(ctx, "qwen3-tts.speaker_encoder.embedding_length") >= 0);
+
+    // speaker presets (custom_voice models)
+    auto read_str_array = [&](const char * key, std::vector<std::string> & out) {
+        int64_t idx = gguf_find_key(ctx, key);
+        if (idx < 0) return;
+        int n = (int)gguf_get_arr_n(ctx, idx);
+        out.resize(n);
+        for (int i = 0; i < n; i++) {
+            out[i] = gguf_get_arr_str(ctx, idx, i);
+        }
+    };
+    auto read_u32_array = [&](const char * key, std::vector<int32_t> & out) {
+        int64_t idx = gguf_find_key(ctx, key);
+        if (idx < 0) return;
+        int n = (int)gguf_get_arr_n(ctx, idx);
+        out.resize(n);
+        for (int i = 0; i < n; i++) {
+            out[i] = (int32_t)((const uint32_t *)gguf_get_arr_data(ctx, idx))[i];
+        }
+    };
+
+    read_str_array("qwen3-tts.speaker.names", cfg.speaker_names);
+    read_u32_array("qwen3-tts.speaker.ids", cfg.speaker_ids);
+    read_str_array("qwen3-tts.speaker.dialects", cfg.speaker_dialects);
+    read_str_array("qwen3-tts.language.names", cfg.language_names);
+    read_u32_array("qwen3-tts.language.ids", cfg.language_ids);
+
     return true;
 }
 
 bool TTSTransformer::create_tensors(struct gguf_context * ctx) {
     const int64_t n_tensors = gguf_get_n_tensors(ctx);
-    const auto & cfg = model_.config;
+    auto & cfg = model_.config;
+
+    // Resolve code_pred sizes: 0 means same as talker
+    if (cfg.code_pred_hidden_size == 0) {
+        cfg.code_pred_hidden_size = cfg.hidden_size;
+    }
+    if (cfg.code_pred_intermediate_size == 0) {
+        cfg.code_pred_intermediate_size = cfg.intermediate_size;
+    }
+    const int32_t cp_hidden = cfg.code_pred_hidden_size;
+    const int32_t cp_intermediate = cfg.code_pred_intermediate_size;
     
     const size_t ctx_size = n_tensors * ggml_tensor_overhead();
     struct ggml_init_params params = {
@@ -461,11 +519,11 @@ bool TTSTransformer::create_tensors(struct gguf_context * ctx) {
                 continue;
             }
             int layer_idx = -1;
-            if (sscanf(name, "code_pred.blk.%d.", &layer_idx) == 1 && 
+            if (sscanf(name, "code_pred.blk.%d.", &layer_idx) == 1 &&
                 layer_idx >= 0 && layer_idx < cfg.code_pred_layers) {
-                
+
                 if (strstr(name, "attn_norm.weight")) {
-                    ne[0] = cfg.hidden_size;
+                    ne[0] = cp_hidden;
                     n_dims = 1;
                 } else if (strstr(name, "attn_q_norm.weight")) {
                     ne[0] = cfg.head_dim;
@@ -474,35 +532,35 @@ bool TTSTransformer::create_tensors(struct gguf_context * ctx) {
                     ne[0] = cfg.head_dim;
                     n_dims = 1;
                 } else if (strstr(name, "attn_q.weight")) {
-                    ne[0] = cfg.hidden_size;
+                    ne[0] = cp_hidden;
                     ne[1] = cfg.n_attention_heads * cfg.head_dim;
                     n_dims = 2;
                 } else if (strstr(name, "attn_k.weight")) {
-                    ne[0] = cfg.hidden_size;
+                    ne[0] = cp_hidden;
                     ne[1] = cfg.n_key_value_heads * cfg.head_dim;
                     n_dims = 2;
                 } else if (strstr(name, "attn_v.weight")) {
-                    ne[0] = cfg.hidden_size;
+                    ne[0] = cp_hidden;
                     ne[1] = cfg.n_key_value_heads * cfg.head_dim;
                     n_dims = 2;
                 } else if (strstr(name, "attn_output.weight")) {
                     ne[0] = cfg.n_attention_heads * cfg.head_dim;
-                    ne[1] = cfg.hidden_size;
+                    ne[1] = cp_hidden;
                     n_dims = 2;
                 } else if (strstr(name, "ffn_norm.weight")) {
-                    ne[0] = cfg.hidden_size;
+                    ne[0] = cp_hidden;
                     n_dims = 1;
                 } else if (strstr(name, "ffn_gate.weight")) {
-                    ne[0] = cfg.hidden_size;
-                    ne[1] = cfg.intermediate_size;
+                    ne[0] = cp_hidden;
+                    ne[1] = cp_intermediate;
                     n_dims = 2;
                 } else if (strstr(name, "ffn_up.weight")) {
-                    ne[0] = cfg.hidden_size;
-                    ne[1] = cfg.intermediate_size;
+                    ne[0] = cp_hidden;
+                    ne[1] = cp_intermediate;
                     n_dims = 2;
                 } else if (strstr(name, "ffn_down.weight")) {
-                    ne[0] = cfg.intermediate_size;
-                    ne[1] = cfg.hidden_size;
+                    ne[0] = cp_intermediate;
+                    ne[1] = cp_hidden;
                     n_dims = 2;
                 } else {
                     continue;
@@ -514,6 +572,7 @@ bool TTSTransformer::create_tensors(struct gguf_context * ctx) {
             int cb_idx = -1;
             if (sscanf(name, "code_pred.codec_embd.%d.weight", &cb_idx) == 1 &&
                 cb_idx >= 0 && cb_idx < cfg.n_codebooks - 1) {
+                // codec_embd maps from vocab to the input space (talker hidden_size)
                 ne[0] = cfg.hidden_size;
                 ne[1] = cfg.code_pred_vocab_size;
                 n_dims = 2;
@@ -527,7 +586,7 @@ bool TTSTransformer::create_tensors(struct gguf_context * ctx) {
              int cb_idx = -1;
              if (sscanf(name, "code_pred.lm_head.%d.weight", &cb_idx) == 1 &&
                  cb_idx >= 0 && cb_idx < cfg.n_codebooks - 1) {
-                 ne[0] = cfg.hidden_size;
+                 ne[0] = cp_hidden;
                  ne[1] = cfg.code_pred_vocab_size;
                  n_dims = 2;
              } else {
@@ -537,7 +596,15 @@ bool TTSTransformer::create_tensors(struct gguf_context * ctx) {
              if (skip_ggml_code_pred_layers_) {
                  continue;
              }
-             ne[0] = cfg.hidden_size;
+             ne[0] = cp_hidden;
+             n_dims = 1;
+         } else if (strstr(name, "code_pred.mtp_proj.weight")) {
+             // Projects from talker hidden_size to code_pred hidden_size
+             ne[0] = cfg.hidden_size;  // input: talker hidden
+             ne[1] = cp_hidden;        // output: code_pred hidden
+             n_dims = 2;
+         } else if (strstr(name, "code_pred.mtp_proj.bias")) {
+             ne[0] = cp_hidden;
              n_dims = 1;
          } else {
              continue;
@@ -615,9 +682,25 @@ bool TTSTransformer::create_tensors(struct gguf_context * ctx) {
              }
          } else if (strstr(name, "code_pred.output_norm.weight")) {
              model_.code_pred_output_norm = tensor;
+         } else if (strstr(name, "code_pred.mtp_proj.weight")) {
+             model_.mtp_proj_weight = tensor;
+         } else if (strstr(name, "code_pred.mtp_proj.bias")) {
+             model_.mtp_proj_bias = tensor;
          }
      }
-     
+
+     // Validate MTP projection consistency
+     const bool has_mtp_w = model_.mtp_proj_weight != nullptr;
+     const bool has_mtp_b = model_.mtp_proj_bias != nullptr;
+     if (has_mtp_w != has_mtp_b) {
+         error_msg_ = "Invalid model: code_pred.mtp_proj weight/bias mismatch";
+         return false;
+     }
+     if (cfg.code_pred_hidden_size != cfg.hidden_size && !has_mtp_w) {
+         error_msg_ = "Invalid model: code_pred hidden_size differs from talker but mtp_proj is missing";
+         return false;
+     }
+
      return true;
  }
 
@@ -659,7 +742,7 @@ bool TTSTransformer::load_tensor_data(const std::string & path, struct gguf_cont
         
         read_buf.resize(nbytes);
         
-        if (fseek(f, data_offset + offset, SEEK_SET) != 0) {
+        if (fseek(f, (long)(data_offset + offset), SEEK_SET) != 0) {
             error_msg_ = "Failed to seek to tensor data: " + std::string(name);
             fclose(f);
             release_preferred_backend(backend);
@@ -985,7 +1068,13 @@ bool TTSTransformer::build_prefill_graph(const int32_t * text_tokens, int32_t n_
                                          const float * speaker_embd, int32_t language_id,
                                          std::vector<float> & prefill_embd,
                                          std::vector<float> & trailing_text_hidden,
-                                         std::vector<float> & tts_pad_embed) {
+                                         std::vector<float> & tts_pad_embed,
+                                         const int32_t * instruct_tokens,
+                                         int32_t n_instruct_tokens,
+                                         const int32_t * ref_text_tokens,
+                                         int32_t n_ref_text_tokens,
+                                         const int32_t * ref_codes,
+                                         int32_t n_ref_frames) {
     if (!text_tokens) {
         error_msg_ = "text_tokens is null";
         return false;
@@ -1094,29 +1183,177 @@ bool TTSTransformer::build_prefill_graph(const int32_t * text_tokens, int32_t n_
         first_text_plus_codec_bos[h] = first_text_embed[h] + codec_bos_embed[h];
     }
 
-    const int32_t prefill_len = 3 + codec_plus_overlay_len + 1;
-    prefill_embd.resize((size_t)prefill_len * hidden_size);
-    memcpy(prefill_embd.data(), role_embed.data(), role_embed.size() * sizeof(float));
-    memcpy(prefill_embd.data() + (size_t)3 * hidden_size,
-           codec_plus_overlay.data(), codec_plus_overlay.size() * sizeof(float));
-    memcpy(prefill_embd.data() + (size_t)(prefill_len - 1) * hidden_size,
-           first_text_plus_codec_bos.data(), hidden_size * sizeof(float));
-
-    const int32_t trailing_token_count = std::max(0, n_tokens - 9);
-    std::vector<float> trailing_text_proj;
-    if (trailing_token_count > 0) {
-        if (!project_text_tokens(text_tokens + 4, trailing_token_count, trailing_text_proj)) {
+    // project instruction tokens if provided (prepended before role tokens)
+    std::vector<float> instruct_proj;
+    if (instruct_tokens && n_instruct_tokens > 0) {
+        if (!project_text_tokens(instruct_tokens, n_instruct_tokens, instruct_proj)) {
             return false;
         }
     }
 
-    const int32_t trailing_len = trailing_token_count + 1;
-    trailing_text_hidden.resize((size_t)trailing_len * hidden_size);
-    if (trailing_token_count > 0) {
-        memcpy(trailing_text_hidden.data(), trailing_text_proj.data(), trailing_text_proj.size() * sizeof(float));
+    const bool icl_mode = (ref_codes && n_ref_frames > 0 && ref_text_tokens && n_ref_text_tokens > 0);
+
+    if (icl_mode) {
+        // ── ICL prefill assembly ─────────────────────────────────────
+        // matches Python generate_icl_prompt() (non-streaming mode)
+        //
+        // prefix: [instructions?, role(3), codec_overlay]
+        // ICL text section: ref_text + new_text projected, overlaid with codec_pad_embed
+        // ICL codec section: codec_bos + ref_code embeddings, overlaid with tts_pad_embed
+        // trailing: just tts_pad_embed (1 token)
+
+        // extract new text content tokens (skip 3 role tokens, skip 5 suffix tokens)
+        const int32_t new_text_content_count = std::max(0, n_tokens - 8);
+        const int32_t * new_text_content = text_tokens + 3;
+
+        // project ref_text + new_text together
+        std::vector<int32_t> combined_text(n_ref_text_tokens + new_text_content_count);
+        if (n_ref_text_tokens > 0) {
+            memcpy(combined_text.data(), ref_text_tokens, n_ref_text_tokens * sizeof(int32_t));
+        }
+        if (new_text_content_count > 0) {
+            memcpy(combined_text.data() + n_ref_text_tokens, new_text_content,
+                   new_text_content_count * sizeof(int32_t));
+        }
+
+        std::vector<float> text_proj;
+        if (!combined_text.empty()) {
+            if (!project_text_tokens(combined_text.data(), (int32_t)combined_text.size(), text_proj)) {
+                return false;
+            }
+        }
+
+        const int32_t text_len = (int32_t)combined_text.size() + 1; // +1 for tts_eos
+        std::vector<float> icl_text_section((size_t)text_len * hidden_size);
+
+        // text tokens overlaid with codec_pad_embed
+        std::vector<float> codec_pad_embed(hidden_size);
+        {
+            int32_t codec_pad_tok = cfg.codec_pad_id;
+            std::vector<float> tmp;
+            if (!lookup_embedding_rows(model_.codec_embd, &codec_pad_tok, 1,
+                                       "inp_icl_codec_pad", "icl_codec_pad_emb", tmp)) {
+                return false;
+            }
+            memcpy(codec_pad_embed.data(), tmp.data(), hidden_size * sizeof(float));
+        }
+
+        for (int32_t t = 0; t < (int32_t)combined_text.size(); ++t) {
+            float * dst = icl_text_section.data() + (size_t)t * hidden_size;
+            const float * text_row = text_proj.data() + (size_t)t * hidden_size;
+            for (int32_t h = 0; h < hidden_size; ++h) {
+                dst[h] = text_row[h] + codec_pad_embed[h];
+            }
+        }
+        // tts_eos overlaid with codec_pad
+        {
+            float * dst = icl_text_section.data() + (size_t)(text_len - 1) * hidden_size;
+            for (int32_t h = 0; h < hidden_size; ++h) {
+                dst[h] = tts_eos_embed[h] + codec_pad_embed[h];
+            }
+        }
+
+        // embed ref_codes: for each frame, sum codebook embeddings across all codebooks
+        // codebook 0: model_.codec_embd
+        // codebooks 1-15: model_.code_pred_embd[cb-1]
+        const int32_t codec_section_len = 1 + n_ref_frames; // codec_bos + ref_codes
+        std::vector<float> icl_codec_section((size_t)codec_section_len * hidden_size, 0.0f);
+
+        // codec_bos overlaid with tts_pad
+        {
+            int32_t bos_tok = cfg.codec_bos_id;
+            std::vector<float> bos_emb;
+            if (!lookup_embedding_rows(model_.codec_embd, &bos_tok, 1,
+                                       "inp_icl_codec_bos", "icl_codec_bos_emb", bos_emb)) {
+                return false;
+            }
+            float * dst = icl_codec_section.data();
+            for (int32_t h = 0; h < hidden_size; ++h) {
+                dst[h] = bos_emb[h] + tts_pad_embed[h];
+            }
+        }
+
+        // ref_code embeddings: sum across codebooks, overlay with tts_pad
+        std::vector<float> embd_row(hidden_size);
+        for (int32_t f = 0; f < n_ref_frames; ++f) {
+            float * dst = icl_codec_section.data() + (size_t)(1 + f) * hidden_size;
+
+            // sum codebook embeddings for this frame
+            for (int cb = 0; cb < cfg.n_codebooks; ++cb) {
+                int32_t code = ref_codes[f * cfg.n_codebooks + cb];
+                if (cb == 0) {
+                    if (!lookup_single_embedding_row(model_.codec_embd, code, embd_row.data())) {
+                        return false;
+                    }
+                } else {
+                    if ((int)model_.code_pred_embd.size() < cb) continue;
+                    if (!lookup_single_embedding_row(model_.code_pred_embd[cb - 1], code, embd_row.data())) {
+                        return false;
+                    }
+                }
+                for (int32_t h = 0; h < hidden_size; ++h) {
+                    dst[h] += embd_row[h];
+                }
+            }
+
+            // overlay with tts_pad_embed
+            for (int32_t h = 0; h < hidden_size; ++h) {
+                dst[h] += tts_pad_embed[h];
+            }
+        }
+
+        // assemble full prefill: [instructions?, role, codec_overlay, ICL_text, ICL_codec]
+        const int32_t prefix_len = n_instruct_tokens + 3 + codec_plus_overlay_len;
+        const int32_t prefill_len = prefix_len + text_len + codec_section_len;
+        prefill_embd.resize((size_t)prefill_len * hidden_size);
+
+        size_t offset = 0;
+        if (!instruct_proj.empty()) {
+            memcpy(prefill_embd.data(), instruct_proj.data(), instruct_proj.size() * sizeof(float));
+            offset = (size_t)n_instruct_tokens * hidden_size;
+        }
+        memcpy(prefill_embd.data() + offset, role_embed.data(), role_embed.size() * sizeof(float));
+        memcpy(prefill_embd.data() + offset + (size_t)3 * hidden_size,
+               codec_plus_overlay.data(), codec_plus_overlay.size() * sizeof(float));
+        memcpy(prefill_embd.data() + (size_t)prefix_len * hidden_size,
+               icl_text_section.data(), icl_text_section.size() * sizeof(float));
+        memcpy(prefill_embd.data() + (size_t)(prefix_len + text_len) * hidden_size,
+               icl_codec_section.data(), icl_codec_section.size() * sizeof(float));
+
+        // in ICL mode, trailing is just tts_pad_embed (all text already in prefill)
+        trailing_text_hidden.resize(hidden_size);
+        memcpy(trailing_text_hidden.data(), tts_pad_embed.data(), hidden_size * sizeof(float));
+    } else {
+        // ── non-ICL prefill (existing path) ──────────────────────────
+        const int32_t prefill_len = n_instruct_tokens + 3 + codec_plus_overlay_len + 1;
+        prefill_embd.resize((size_t)prefill_len * hidden_size);
+        size_t offset = 0;
+        if (!instruct_proj.empty()) {
+            memcpy(prefill_embd.data(), instruct_proj.data(), instruct_proj.size() * sizeof(float));
+            offset = (size_t)n_instruct_tokens * hidden_size;
+        }
+        memcpy(prefill_embd.data() + offset, role_embed.data(), role_embed.size() * sizeof(float));
+        memcpy(prefill_embd.data() + offset + (size_t)3 * hidden_size,
+               codec_plus_overlay.data(), codec_plus_overlay.size() * sizeof(float));
+        memcpy(prefill_embd.data() + (size_t)(prefill_len - 1) * hidden_size,
+               first_text_plus_codec_bos.data(), hidden_size * sizeof(float));
+
+        const int32_t trailing_token_count = std::max(0, n_tokens - 9);
+        std::vector<float> trailing_text_proj;
+        if (trailing_token_count > 0) {
+            if (!project_text_tokens(text_tokens + 4, trailing_token_count, trailing_text_proj)) {
+                return false;
+            }
+        }
+
+        const int32_t trailing_len = trailing_token_count + 1;
+        trailing_text_hidden.resize((size_t)trailing_len * hidden_size);
+        if (trailing_token_count > 0) {
+            memcpy(trailing_text_hidden.data(), trailing_text_proj.data(), trailing_text_proj.size() * sizeof(float));
+        }
+        memcpy(trailing_text_hidden.data() + (size_t)(trailing_len - 1) * hidden_size,
+               tts_eos_embed.data(), hidden_size * sizeof(float));
     }
-    memcpy(trailing_text_hidden.data() + (size_t)(trailing_len - 1) * hidden_size,
-           tts_eos_embed.data(), hidden_size * sizeof(float));
 
     return true;
 }
@@ -1412,6 +1649,13 @@ struct ggml_cgraph * TTSTransformer::build_step_graph(int32_t n_past) {
 
 struct ggml_cgraph * TTSTransformer::build_code_pred_graph(int32_t n_prev_codes) {
     const auto & cfg = model_.config;
+
+    // This legacy path does not support MTP projection (1.7B models)
+    if (cfg.code_pred_hidden_size != cfg.hidden_size) {
+        error_msg_ = "build_code_pred_graph() does not support separated code predictor hidden size; use autoregressive path";
+        return nullptr;
+    }
+
     const int n_head = cfg.n_attention_heads;
     const int n_kv_head = cfg.n_key_value_heads;
     const int head_dim = cfg.head_dim;
@@ -1537,39 +1781,46 @@ struct ggml_cgraph * TTSTransformer::build_code_pred_prefill_graph() {
     const int n_kv_head = cfg.n_key_value_heads;
     const int head_dim = cfg.head_dim;
     const int hidden_size = cfg.hidden_size;
+    const int cp_hidden = cfg.code_pred_hidden_size;
     const float eps = cfg.rms_norm_eps;
     const float rope_theta = cfg.rope_theta;
     const int n_layer = cfg.code_pred_layers;
     const int n_tokens = 2;
-    
+
     struct ggml_init_params params = {
         /*.mem_size   =*/ state_.compute_meta.size(),
         /*.mem_buffer =*/ state_.compute_meta.data(),
         /*.no_alloc   =*/ true,
     };
-    
+
     struct ggml_context * ctx0 = ggml_init(params);
     struct ggml_cgraph * gf = ggml_new_graph_custom(ctx0, QWEN3_TTS_MAX_NODES, false);
-    
+
     // Input: past_hidden from talker [hidden_size]
     struct ggml_tensor * inp_hidden = ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, hidden_size);
     ggml_set_name(inp_hidden, "inp_hidden");
     ggml_set_input(inp_hidden);
-    
+
     // Input: codebook 0 token embedding [hidden_size] (pre-computed using talker's codec_embd)
     struct ggml_tensor * inp_cb0_embd = ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, hidden_size);
     ggml_set_name(inp_cb0_embd, "inp_cb0_embd");
     ggml_set_input(inp_cb0_embd);
-    
+
     struct ggml_tensor * inp_pos = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_tokens);
     ggml_set_name(inp_pos, "inp_pos");
     ggml_set_input(inp_pos);
-    
-    // Concatenate [past_hidden, cb0_embd] -> [2, hidden_size]
+
+    // Concatenate [past_hidden, cb0_embd] -> [hidden_size, 2]
     struct ggml_tensor * hidden_2d = ggml_reshape_2d(ctx0, inp_hidden, hidden_size, 1);
     struct ggml_tensor * cb0_2d = ggml_reshape_2d(ctx0, inp_cb0_embd, hidden_size, 1);
     struct ggml_tensor * cur = ggml_concat(ctx0, hidden_2d, cb0_2d, 1);
-    
+
+    // Apply MTP projection if needed (1.7B: hidden_size -> cp_hidden)
+    if (model_.mtp_proj_weight) {
+        cur = ggml_mul_mat(ctx0, model_.mtp_proj_weight, cur);  // [cp_hidden, 2]
+        cur = ggml_add(ctx0, cur, model_.mtp_proj_bias);
+    }
+
     struct ggml_tensor * inpL = cur;
     
     const float KQscale = 1.0f / sqrtf(float(head_dim));
@@ -1661,17 +1912,18 @@ struct ggml_cgraph * TTSTransformer::build_code_pred_prefill_graph() {
      cur = ggml_rms_norm(ctx0, cur, eps);
      cur = ggml_mul(ctx0, cur, model_.code_pred_output_norm);
      
-     struct ggml_tensor * last_hidden = ggml_view_2d(ctx0, cur, hidden_size, 1, 
-                                                      cur->nb[1], hidden_size * sizeof(float));
-     
+     // Extract last token's hidden state [cp_hidden]
+     struct ggml_tensor * last_hidden = ggml_view_2d(ctx0, cur, cp_hidden, 1,
+                                                      cur->nb[1], (int64_t)cp_hidden * sizeof(float));
+
      struct ggml_tensor * logits = ggml_mul_mat(ctx0, model_.code_pred_head[0], last_hidden);
     ggml_set_name(logits, "logits");
     ggml_set_output(logits);
-    
+
     ggml_build_forward_expand(gf, logits);
-    
+
     ggml_free(ctx0);
-    
+
     return gf;
 }
 
@@ -1685,34 +1937,40 @@ struct ggml_cgraph * TTSTransformer::build_code_pred_step_graph(int32_t n_past, 
     const float rope_theta = cfg.rope_theta;
     const int n_layer = cfg.code_pred_layers;
     const int n_tokens = 1;
-    
+
     struct ggml_init_params params = {
         /*.mem_size   =*/ state_.compute_meta.size(),
         /*.mem_buffer =*/ state_.compute_meta.data(),
         /*.no_alloc   =*/ true,
     };
-    
+
     struct ggml_context * ctx0 = ggml_init(params);
     struct ggml_cgraph * gf = ggml_new_graph_custom(ctx0, QWEN3_TTS_MAX_NODES, false);
-    
+
+    // inp_hidden is [hidden_size] (talker's dimension), used only for generation_step == 0
     struct ggml_tensor * inp_hidden = ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, hidden_size);
     ggml_set_name(inp_hidden, "inp_hidden");
     ggml_set_input(inp_hidden);
-    
+
     struct ggml_tensor * inp_code = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, 1);
     ggml_set_name(inp_code, "inp_code");
     ggml_set_input(inp_code);
-    
+
     struct ggml_tensor * inp_pos = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, 1);
     ggml_set_name(inp_pos, "inp_pos");
     ggml_set_input(inp_pos);
-    
+
     struct ggml_tensor * cur;
     if (generation_step == 0) {
         cur = ggml_reshape_2d(ctx0, inp_hidden, hidden_size, 1);
     } else {
         cur = ggml_get_rows(ctx0, model_.code_pred_embd[generation_step - 1], inp_code);
         cur = ggml_reshape_2d(ctx0, cur, hidden_size, 1);
+    }
+    // Apply MTP projection if needed (1.7B: hidden_size -> cp_hidden)
+    if (model_.mtp_proj_weight) {
+        cur = ggml_mul_mat(ctx0, model_.mtp_proj_weight, cur);  // [cp_hidden, 1]
+        cur = ggml_add(ctx0, cur, model_.mtp_proj_bias);
     }
     
     struct ggml_tensor * inpL = cur;
@@ -2580,7 +2838,13 @@ bool TTSTransformer::generate(const int32_t * text_tokens, int32_t n_tokens,
                                int32_t language_id,
                                float repetition_penalty,
                                float temperature,
-                               int32_t top_k) {
+                               int32_t top_k,
+                               const int32_t * instruct_tokens,
+                               int32_t n_instruct_tokens,
+                               const int32_t * ref_text_tokens,
+                               int32_t n_ref_text_tokens,
+                               const int32_t * ref_codes,
+                               int32_t n_ref_frames) {
 #ifdef QWEN3_TTS_TIMING
     using clk = std::chrono::high_resolution_clock;
     tts_timing timing = {};
@@ -2616,7 +2880,10 @@ bool TTSTransformer::generate(const int32_t * text_tokens, int32_t n_tokens,
     t0 = clk::now();
 #endif
     if (!build_prefill_graph(text_tokens, n_tokens, speaker_embd, language_id,
-                             prefill_embd, trailing_text_hidden, tts_pad_embed)) {
+                             prefill_embd, trailing_text_hidden, tts_pad_embed,
+                             instruct_tokens, n_instruct_tokens,
+                             ref_text_tokens, n_ref_text_tokens,
+                             ref_codes, n_ref_frames)) {
         return false;
     }
 #ifdef QWEN3_TTS_TIMING
@@ -2662,6 +2929,10 @@ bool TTSTransformer::generate(const int32_t * text_tokens, int32_t n_tokens,
     std::vector<float> embd_row(cfg.hidden_size);
     
     for (int frame = 0; frame < max_len; ++frame) {
+        if (is_aborted()) {
+            error_msg_ = "Aborted";
+            return false;
+        }
         // Suppress tokens in [codec_vocab_size - 1024, codec_vocab_size), except codec_eos_id
         for (int32_t i = suppress_start; i < cfg.codec_vocab_size; ++i) {
             if (i != cfg.codec_eos_id) {
@@ -2879,6 +3150,17 @@ void free_transformer_model(tts_transformer_model & model) {
     model.code_pred_layers.clear();
     model.code_pred_embd.clear();
     model.code_pred_head.clear();
+    model.text_embd = nullptr;
+    model.text_proj_fc1 = nullptr;
+    model.text_proj_fc1_bias = nullptr;
+    model.text_proj_fc2 = nullptr;
+    model.text_proj_fc2_bias = nullptr;
+    model.codec_embd = nullptr;
+    model.output_norm = nullptr;
+    model.codec_head = nullptr;
+    model.code_pred_output_norm = nullptr;
+    model.mtp_proj_weight = nullptr;
+    model.mtp_proj_bias = nullptr;
 }
 
 void free_tts_kv_cache(tts_kv_cache & cache) {
@@ -2894,6 +3176,27 @@ void free_tts_kv_cache(tts_kv_cache & cache) {
     cache.v_cache.clear();
     cache.n_ctx = 0;
     cache.n_used = 0;
+}
+
+void TTSTransformer::set_abort_callback(ggml_abort_callback callback, void * data) {
+    abort_cb_ = callback;
+    abort_data_ = data;
+    if (state_.backend_cpu) {
+        ggml_backend_cpu_set_abort_callback(state_.backend_cpu, callback, data);
+    }
+}
+
+bool TTSTransformer::is_aborted() const {
+    return abort_cb_ && abort_cb_(abort_data_);
+}
+
+bool TTSTransformer::get_codec_embedding(int32_t token_id, std::vector<float> & output) {
+    if (!model_.codec_embd) {
+        error_msg_ = "Model not loaded";
+        return false;
+    }
+    output.resize(model_.config.hidden_size);
+    return lookup_single_embedding_row(model_.codec_embd, token_id, output.data());
 }
 
 } // namespace qwen3_tts

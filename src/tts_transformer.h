@@ -56,10 +56,25 @@ struct tts_timing {
 
 // TTS Transformer configuration (Qwen2-based Talker)
 struct tts_transformer_config {
+    // Model variant: "base", "custom_voice", or "voice_design"
+    std::string model_type = "base";
+    std::string model_size;  // "0b6", "1b7"
+
+    // Speaker presets (custom_voice models only)
+    std::vector<std::string> speaker_names;
+    std::vector<int32_t> speaker_ids;
+    std::vector<std::string> speaker_dialects;
+
+    // Language map
+    std::vector<std::string> language_names;
+    std::vector<int32_t> language_ids;
+
+    bool has_speaker_encoder = false;
+
     // Text embedding
     int32_t text_vocab_size = 151936;
     int32_t text_embd_dim = 2048;
-    
+
     // Talker transformer
     int32_t hidden_size = 1024;
     int32_t n_layers = 28;
@@ -69,18 +84,20 @@ struct tts_transformer_config {
     int32_t head_dim = 128;
     float rms_norm_eps = 1e-6f;
     float rope_theta = 1000000.0f;
-    
+
     // M-RoPE sections [time, freq, channel] = [24, 20, 20]
     int32_t mrope_section[3] = {24, 20, 20};
-    
+
     // Codec vocabulary
     int32_t codec_vocab_size = 3072;  // talker.codec_embd/codec_head
     int32_t n_codebooks = 16;
-    
+
     // Code predictor
     int32_t code_pred_layers = 5;
     int32_t code_pred_vocab_size = 2048;  // Per-codebook vocab
-    
+    int32_t code_pred_hidden_size = 0;    // 0 = same as hidden_size (0.6B), otherwise separate (1.7B)
+    int32_t code_pred_intermediate_size = 0; // 0 = same as intermediate_size
+
     // Special codec tokens
     int32_t codec_pad_id = 2148;
     int32_t codec_bos_id = 2149;
@@ -148,6 +165,10 @@ struct tts_transformer_model {
      // Code predictor per-codebook embeddings and heads (15 codebooks, 0 uses talker output)
      std::vector<struct ggml_tensor *> code_pred_embd;  // [hidden_size, code_pred_vocab_size] x 15
      std::vector<struct ggml_tensor *> code_pred_head;  // [hidden_size, code_pred_vocab_size] x 15
+
+     // MTP projection (optional, 1.7B only: projects talker hidden to code_pred hidden)
+     struct ggml_tensor * mtp_proj_weight = nullptr;  // [code_pred_hidden, talker_hidden]
+     struct ggml_tensor * mtp_proj_bias = nullptr;    // [code_pred_hidden]
     
     // GGML context for tensor metadata
     struct ggml_context * ctx = nullptr;
@@ -264,11 +285,26 @@ public:
                   int32_t language_id = 2050,
                   float repetition_penalty = 1.05f,
                   float temperature = 0.9f,
-                  int32_t top_k = 50);
+                  int32_t top_k = 50,
+                  const int32_t * instruct_tokens = nullptr,
+                  int32_t n_instruct_tokens = 0,
+                  const int32_t * ref_text_tokens = nullptr,
+                  int32_t n_ref_text_tokens = 0,
+                  const int32_t * ref_codes = nullptr,
+                  int32_t n_ref_frames = 0);
     
     const tts_transformer_config & get_config() const { return model_.config; }
-    
+
+    // extract a single row from codec_embd for a given token ID
+    bool get_codec_embedding(int32_t token_id, std::vector<float> & output);
+
     const std::string & get_error() const { return error_msg_; }
+
+    // Set abort callback checked before each graph compute (thread-safe)
+    void set_abort_callback(ggml_abort_callback callback, void * data);
+
+    // Check if abort has been requested
+    bool is_aborted() const;
     
     // Legacy interface for compatibility
     bool forward(const int32_t * tokens, int32_t n_tokens, int32_t n_past,
@@ -290,7 +326,13 @@ private:
                              const float * speaker_embd, int32_t language_id,
                              std::vector<float> & prefill_embd,
                              std::vector<float> & trailing_text_hidden,
-                             std::vector<float> & tts_pad_embed);
+                             std::vector<float> & tts_pad_embed,
+                             const int32_t * instruct_tokens = nullptr,
+                             int32_t n_instruct_tokens = 0,
+                             const int32_t * ref_text_tokens = nullptr,
+                             int32_t n_ref_text_tokens = 0,
+                             const int32_t * ref_codes = nullptr,
+                             int32_t n_ref_frames = 0);
 
     struct ggml_cgraph * build_prefill_forward_graph(int32_t n_tokens, int32_t n_past);
 
@@ -329,6 +371,8 @@ private:
     tts_transformer_model model_;
     tts_transformer_state state_;
     std::string error_msg_;
+    ggml_abort_callback abort_cb_ = nullptr;
+    void * abort_data_ = nullptr;
     
     // Cached hidden states from last forward pass
     std::vector<float> last_hidden_;

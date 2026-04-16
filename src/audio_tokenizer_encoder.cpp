@@ -768,4 +768,16 @@ void free_speaker_encoder_model(speaker_encoder_model & model) {
     model.tensors.clear();
 }
 
+void AudioTokenizerEncoder::set_abort_callback(ggml_abort_callback callback, void * data) {
+    abort_cb_ = callback;
+    abort_data_ = data;
+    if (state_.backend_cpu) {
+        ggml_backend_cpu_set_abort_callback(state_.backend_cpu, callback, data);
+    }
+}
+
+bool AudioTokenizerEncoder::is_aborted() const {
+    return abort_cb_ && abort_cb_(abort_data_);
+}
+
 } // namespace qwen3_tts

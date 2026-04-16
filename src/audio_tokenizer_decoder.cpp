@@ -37,40 +37,6 @@ void AudioTokenizerDecoder::unload_model() {
     codes_buf_.clear();
 }
 
-void AudioTokenizerDecoder::normalize_codebooks() {
-    const float epsilon = 1e-5f;
-    
-    auto normalize_codebook = [epsilon](struct ggml_tensor * codebook, struct ggml_tensor * usage, const char *) {
-        if (!codebook || !usage || !codebook->data || !usage->data) return;
-        
-        int64_t codebook_dim = codebook->ne[0];
-        int64_t codebook_size = codebook->ne[1];
-        
-        ggml_fp16_t * cb_data = (ggml_fp16_t *)codebook->data;
-        float * usage_data = (float *)usage->data;
-        
-        for (int64_t emb_idx = 0; emb_idx < codebook_size; ++emb_idx) {
-            float u = usage_data[emb_idx];
-            if (u < epsilon) u = epsilon;
-            float inv_u = 1.0f / u;
-            
-            for (int64_t dim_idx = 0; dim_idx < codebook_dim; ++dim_idx) {
-                int64_t mem_idx = dim_idx + emb_idx * codebook_dim;
-                float val = ggml_fp16_to_fp32(cb_data[mem_idx]);
-                cb_data[mem_idx] = ggml_fp32_to_fp16(val * inv_u);
-            }
-        }
-        
-    };
-    
-    normalize_codebook(model_.vq_first_codebook, model_.vq_first_usage, "first");
-    
-    for (int i = 0; i < 15; ++i) {
-        char name[16];
-        snprintf(name, sizeof(name), "rest%d", i);
-        normalize_codebook(model_.vq_rest_codebook[i], model_.vq_rest_usage[i], name);
-    }
-}
 
 bool AudioTokenizerDecoder::load_model(const std::string & model_path) {
     unload_model();
@@ -327,16 +293,45 @@ bool AudioTokenizerDecoder::load_model(const std::string & model_path) {
         model_.dec_blocks[i].res[2].dilation = 9;
     }
     
-    normalize_codebooks();
-    // Codebooks are normalized in host memory; sync once to backend tensors.
-    auto upload_if_present = [](struct ggml_tensor * t) {
-        if (t && t->data) {
-            ggml_backend_tensor_set(t, t->data, 0, ggml_nbytes(t));
+    // Normalize codebooks using GPU-safe memory access pattern.
+    // Download tensor data to host, normalize on CPU, then upload back.
+    {
+        const float epsilon = 1e-5f;
+        std::vector<ggml_fp16_t> cb_buf;
+        std::vector<float> usage_buf;
+
+        auto normalize_and_upload = [&](struct ggml_tensor * codebook, struct ggml_tensor * usage) {
+            if (!codebook || !usage) return;
+
+            const int64_t codebook_dim  = codebook->ne[0];
+            const int64_t codebook_size = codebook->ne[1];
+            const size_t cb_elems    = codebook_dim * codebook_size;
+            const size_t usage_elems = static_cast<size_t>(codebook_size);
+
+            cb_buf.resize(cb_elems);
+            usage_buf.resize(usage_elems);
+            ggml_backend_tensor_get(codebook, cb_buf.data(), 0, cb_elems * sizeof(ggml_fp16_t));
+            ggml_backend_tensor_get(usage, usage_buf.data(), 0, usage_elems * sizeof(float));
+
+            for (int64_t emb_idx = 0; emb_idx < codebook_size; ++emb_idx) {
+                float u = usage_buf[emb_idx];
+                if (u < epsilon) u = epsilon;
+                float inv_u = 1.0f / u;
+
+                for (int64_t dim_idx = 0; dim_idx < codebook_dim; ++dim_idx) {
+                    int64_t mem_idx = dim_idx + emb_idx * codebook_dim;
+                    float val = ggml_fp16_to_fp32(cb_buf[mem_idx]);
+                    cb_buf[mem_idx] = ggml_fp32_to_fp16(val * inv_u);
+                }
+            }
+
+            ggml_backend_tensor_set(codebook, cb_buf.data(), 0, cb_elems * sizeof(ggml_fp16_t));
+        };
+
+        normalize_and_upload(model_.vq_first_codebook, model_.vq_first_usage);
+        for (int i = 0; i < 15; ++i) {
+            normalize_and_upload(model_.vq_rest_codebook[i], model_.vq_rest_usage[i]);
         }
-    };
-    upload_if_present(model_.vq_first_codebook);
-    for (int i = 0; i < 15; ++i) {
-        upload_if_present(model_.vq_rest_codebook[i]);
     }
     
     state_.backend = init_preferred_backend("AudioTokenizerDecoder", &error_msg_);
@@ -888,6 +883,18 @@ void free_audio_decoder_model(audio_decoder_model & model) {
         model.ctx = nullptr;
     }
     model.tensors.clear();
+}
+
+void AudioTokenizerDecoder::set_abort_callback(ggml_abort_callback callback, void * data) {
+    abort_cb_ = callback;
+    abort_data_ = data;
+    if (state_.backend_cpu) {
+        ggml_backend_cpu_set_abort_callback(state_.backend_cpu, callback, data);
+    }
+}
+
+bool AudioTokenizerDecoder::is_aborted() const {
+    return abort_cb_ && abort_cb_(abort_data_);
 }
 
 } // namespace qwen3_tts
