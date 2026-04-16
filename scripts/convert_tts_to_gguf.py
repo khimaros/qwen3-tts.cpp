@@ -1,11 +1,18 @@
 #!/usr/bin/env python3
 """
-Convert HuggingFace Qwen3-TTS-12Hz-0.6B-Base model to GGUF format.
+Convert HuggingFace Qwen3-TTS models to GGUF format.
+
+Supports all model variants:
+  - Qwen3-TTS-12Hz-0.6B-Base
+  - Qwen3-TTS-12Hz-0.6B-CustomVoice
+  - Qwen3-TTS-12Hz-1.7B-Base
+  - Qwen3-TTS-12Hz-1.7B-CustomVoice
+  - Qwen3-TTS-12Hz-1.7B-VoiceDesign
 
 Usage:
     python scripts/convert_tts_to_gguf.py \
-        --input models/Qwen3-TTS-12Hz-0.6B-Base \
-        --output models/qwen3-tts-0.6b-f16.gguf \
+        --input models/Qwen3-TTS-12Hz-1.7B-CustomVoice \
+        --output models/qwen3-tts-1.7b-customvoice-f16.gguf \
         --type f16
 """
 
@@ -39,7 +46,7 @@ logger = logging.getLogger(__name__)
 
 
 class Qwen3TTSConverter:
-    """Converter for Qwen3-TTS-12Hz-0.6B-Base model to GGUF format."""
+    """Converter for Qwen3-TTS models (all variants) to GGUF format."""
 
     # Direct tensor name mapping from HuggingFace to GGML conventions
     TENSOR_MAP = {
@@ -55,6 +62,9 @@ class Qwen3TTSConverter:
         "talker.text_projection.linear_fc2.bias": "talker.text_proj.fc2.bias",
         # Code Predictor - Output norm
         "talker.code_predictor.model.norm.weight": "code_pred.output_norm.weight",
+        # Code Predictor - MTP projection (1.7B only: projects talker hidden to code_pred hidden)
+        "talker.code_predictor.small_to_mtp_projection.weight": "code_pred.mtp_proj.weight",
+        "talker.code_predictor.small_to_mtp_projection.bias": "code_pred.mtp_proj.bias",
         # Speaker Encoder - Initial conv
         "speaker_encoder.blocks.0.conv.weight": "spk_enc.conv0.weight",
         "speaker_encoder.blocks.0.conv.bias": "spk_enc.conv0.bias",
@@ -156,6 +166,18 @@ class Qwen3TTSConverter:
         code_predictor_config = talker_config.get("code_predictor_config", {})
         speaker_encoder_config = self.config.get("speaker_encoder_config", {})
 
+        # model variant detection
+        self.tts_model_size = self.config.get("tts_model_size", "0b6")
+        self.tts_model_type = self.config.get("tts_model_type", "base")
+        self.has_speaker_encoder = bool(speaker_encoder_config)
+
+        # speaker presets (custom_voice models)
+        self.spk_id = talker_config.get("spk_id", self.config.get("spk_id", {}))
+        self.spk_is_dialect = talker_config.get("spk_is_dialect", self.config.get("spk_is_dialect", {}))
+
+        # language IDs
+        self.codec_language_id = talker_config.get("codec_language_id", self.config.get("codec_language_id", {}))
+
         # Talker parameters
         self.hidden_size = talker_config.get("hidden_size", 1024)
         self.intermediate_size = talker_config.get("intermediate_size", 3072)
@@ -177,21 +199,31 @@ class Qwen3TTSConverter:
         # Code Predictor parameters
         self.code_predictor_num_layers = code_predictor_config.get("num_hidden_layers", 5)
         self.code_predictor_vocab_size = code_predictor_config.get("vocab_size", 2048)
+        self.code_predictor_hidden_size = code_predictor_config.get("hidden_size", self.hidden_size)
+        self.code_predictor_intermediate_size = code_predictor_config.get("intermediate_size", self.intermediate_size)
 
-        # Speaker Encoder parameters
+        # Speaker Encoder parameters (only present in base models)
         self.speaker_enc_dim = speaker_encoder_config.get("enc_dim", 1024)
         self.speaker_sample_rate = speaker_encoder_config.get("sample_rate", 24000)
 
-        # Special codec token IDs
-        self.codec_pad_id = talker_config.get("codec_pad_id", 2148)
-        self.codec_bos_id = talker_config.get("codec_bos_id", 2149)
-        self.codec_eos_id = talker_config.get("codec_eos_token_id", 2150)
+        # Special codec token IDs (may be in talker_config or top-level)
+        self.codec_pad_id = talker_config.get("codec_pad_id", self.config.get("codec_pad_id", 2148))
+        self.codec_bos_id = talker_config.get("codec_bos_id", self.config.get("codec_bos_id", 2149))
+        self.codec_eos_id = talker_config.get("codec_eos_token_id", self.config.get("codec_eos_token_id", 2150))
 
-        # Model name
-        self.model_name = "Qwen3-TTS-12Hz-0.6B"
+        # derive model name from config
+        size_map = {"0b6": "0.6B", "1b7": "1.7B"}
+        type_map = {"base": "Base", "custom_voice": "CustomVoice", "voice_design": "VoiceDesign"}
+        size_str = size_map.get(self.tts_model_size, self.tts_model_size)
+        type_str = type_map.get(self.tts_model_type, self.tts_model_type)
+        self.model_name = f"Qwen3-TTS-12Hz-{size_str}-{type_str}"
 
     def _map_tensor_name(self, hf_name: str) -> str | None:
         """Map HuggingFace tensor name to GGML convention."""
+        # skip speaker encoder tensors for non-base models
+        if not self.has_speaker_encoder and hf_name.startswith("speaker_encoder."):
+            return None
+
         # Check direct mapping first
         if hf_name in self.TENSOR_MAP:
             return self.TENSOR_MAP[hf_name]
@@ -217,15 +249,16 @@ class Qwen3TTSConverter:
                 codebook_idx = match.group(1)
                 return template.format(codebook_idx)
 
-        # Check Speaker Encoder patterns
-        for pattern, template in self.SPEAKER_ENCODER_PATTERNS:
-            match = re.match(pattern, hf_name)
-            if match:
-                groups = match.groups()
-                if len(groups) == 2:
-                    return template.format(groups[0], groups[1])
-                else:
-                    return template.format(groups[0])
+        # Check Speaker Encoder patterns (only present in base models)
+        if self.has_speaker_encoder:
+            for pattern, template in self.SPEAKER_ENCODER_PATTERNS:
+                match = re.match(pattern, hf_name)
+                if match:
+                    groups = match.groups()
+                    if len(groups) == 2:
+                        return template.format(groups[0], groups[1])
+                    else:
+                        return template.format(groups[0])
 
         return None
 
@@ -460,17 +493,43 @@ class Qwen3TTSConverter:
         # Code Predictor parameters
         writer.add_uint32(f"{arch}.code_predictor.layer_count", self.code_predictor_num_layers)
         writer.add_uint32(f"{arch}.code_predictor.vocab_size", self.code_predictor_vocab_size)
+        writer.add_uint32(f"{arch}.code_predictor.embedding_length", self.code_predictor_hidden_size)
+        writer.add_uint32(f"{arch}.code_predictor.feed_forward_length", self.code_predictor_intermediate_size)
 
-        # Speaker Encoder parameters
-        writer.add_uint32(f"{arch}.speaker_encoder.embedding_length", self.speaker_enc_dim)
-        writer.add_uint32(f"{arch}.speaker_encoder.sample_rate", self.speaker_sample_rate)
+        # Model variant metadata
+        writer.add_string(f"{arch}.model_type", self.tts_model_type)
+        writer.add_string(f"{arch}.model_size", self.tts_model_size)
+
+        # Speaker Encoder parameters (only for base models with speaker encoder)
+        if self.has_speaker_encoder:
+            writer.add_uint32(f"{arch}.speaker_encoder.embedding_length", self.speaker_enc_dim)
+            writer.add_uint32(f"{arch}.speaker_encoder.sample_rate", self.speaker_sample_rate)
+
+        # Speaker presets (custom_voice models)
+        if self.spk_id:
+            spk_names = list(self.spk_id.keys())
+            spk_ids = [self.spk_id[n] for n in spk_names]
+            writer.add_array(f"{arch}.speaker.names", spk_names)
+            writer.add_array(f"{arch}.speaker.ids", spk_ids)
+
+            # dialect flags: store as comma-separated string per speaker
+            # "false" or the dialect name (e.g. "sichuan_dialect")
+            dialect_strs = [str(self.spk_is_dialect.get(n, False)).lower() for n in spk_names]
+            writer.add_array(f"{arch}.speaker.dialects", dialect_strs)
+
+        # Language IDs
+        if self.codec_language_id:
+            lang_names = list(self.codec_language_id.keys())
+            lang_ids = [self.codec_language_id[n] for n in lang_names]
+            writer.add_array(f"{arch}.language.names", lang_names)
+            writer.add_array(f"{arch}.language.ids", lang_ids)
 
         # Special codec token IDs
         writer.add_uint32(f"{arch}.codec.pad_id", self.codec_pad_id)
         writer.add_uint32(f"{arch}.codec.bos_id", self.codec_bos_id)
         writer.add_uint32(f"{arch}.codec.eos_id", self.codec_eos_id)
 
-        logger.info("Added model metadata")
+        logger.info(f"Added metadata for {self.model_name} (type={self.tts_model_type})")
 
     def _add_tokenizer(self, writer: gguf.GGUFWriter) -> None:
         """Add tokenizer to GGUF writer."""
@@ -526,7 +585,7 @@ class Qwen3TTSConverter:
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Convert Qwen3-TTS-12Hz-0.6B-Base model to GGUF format"
+        description="Convert Qwen3-TTS models to GGUF format (all variants)"
     )
     parser.add_argument(
         "--input", "-i",

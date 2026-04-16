@@ -6,9 +6,7 @@ build/
 *.dylib
 
 # Models (too large for git)
-models/*.gguf
-models/Qwen3-TTS-*/
-models/coreml/
+models/**
 
 # Reference outputs (generated)
 reference/*.bin

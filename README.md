@@ -12,6 +12,9 @@ This fork ([khimaros/qwen3-tts.cpp](https://github.com/khimaros/qwen3-tts.cpp)) 
 - **WAVE_FORMAT_EXTENSIBLE** WAV header support (e.g. macOS screen recordings)
 - **GPU-safe vocoder codebook normalization** (unbreaks Vulkan backend)
 - **Performance optimizations**: flash attention for decode steps, static KV cache with `ggml_set_rows`, cached vocoder decoder graph
+- **OpenAI-compatible HTTP server** (`qwen3-tts-server`) with `/v1/audio/speech` and `/v1/audio/voices` endpoints, voice cloning via multipart upload, and `--hf-repo` for auto-downloading models from HuggingFace
+- **Multi-variant model support** (Base / CustomVoice / VoiceDesign) with speaker presets and language IDs stored in GGUF metadata
+- **Batch model conversion** script that downloads and converts all Qwen3-TTS variants in one shot
 
 The rest of this README is the original from upstream.
 
