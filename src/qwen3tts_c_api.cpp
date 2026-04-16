@@ -181,37 +181,9 @@ int32_t qwen3_tts_extract_embedding_file(
         float * embedding_out, int32_t max_size) {
     if (!tts || !reference_audio_path || !embedding_out || max_size <= 0) return -1;
 
-    // Load WAV and resample to 24kHz
-    std::vector<float> ref_samples;
-    int ref_sample_rate;
-    if (!qwen3_tts::load_audio_file(reference_audio_path, ref_samples, ref_sample_rate)) {
-        tts->last_error = "Failed to load reference audio: " + std::string(reference_audio_path);
-        return -1;
-    }
-
-    // Resample if needed (same logic as synthesize_with_voice)
-    if (ref_sample_rate != 24000) {
-        // Simple linear resampling
-        double ratio = (double)ref_sample_rate / 24000;
-        int output_len = (int)((double)ref_samples.size() / ratio);
-        std::vector<float> resampled(output_len);
-        for (int i = 0; i < output_len; ++i) {
-            double src_idx = i * ratio;
-            int idx0 = (int)src_idx;
-            int idx1 = idx0 + 1;
-            double frac = src_idx - idx0;
-            if (idx1 >= (int)ref_samples.size()) {
-                resampled[i] = ref_samples.back();
-            } else {
-                resampled[i] = (float)((1.0 - frac) * ref_samples[idx0] + frac * ref_samples[idx1]);
-            }
-        }
-        ref_samples = std::move(resampled);
-    }
-
     AUTORELEASE_BEGIN
     std::vector<float> embedding;
-    if (!tts->engine.extract_speaker_embedding(ref_samples.data(), (int32_t)ref_samples.size(), embedding)) {
+    if (!tts->engine.extract_speaker_embedding(reference_audio_path, embedding)) {
         tts->last_error = tts->engine.get_error();
         AUTORELEASE_END
         return -1;
