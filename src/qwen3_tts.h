@@ -47,6 +47,10 @@ struct tts_params {
 
     // Reference text for ICL voice cloning (when set, enables ICL mode instead of x-vector)
     std::string ref_text;
+
+    // Sampling seed. < 0 means leave RNG as-is (non-deterministic); >= 0 reseeds
+    // the transformer's RNG so runs are reproducible.
+    int64_t seed = -1;
 };
 
 // TTS generation result

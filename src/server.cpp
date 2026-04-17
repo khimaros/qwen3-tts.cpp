@@ -126,11 +126,16 @@ struct server_params {
     std::string host      = "127.0.0.1";
     int         port      = 8080;
     int         n_threads = 4;
+    bool        verbose   = false;
+    float       temperature        = 0.9f;
+    int         top_k              = 50;
+    float       repetition_penalty = 1.05f;
+    int64_t     seed               = -1;
 };
 
 // download a file from a huggingface repo, returns local cache path
 static std::string hf_download(const std::string & repo, const std::string & filename) {
-    std::string cmd = "huggingface-cli download \"" + repo + "\" \"" + filename + "\" --quiet";
+    std::string cmd = "hf download \"" + repo + "\" \"" + filename + "\" --quiet";
     FILE * fp = popen(cmd.c_str(), "r");
     if (!fp) return "";
 
@@ -162,26 +167,34 @@ static std::string hf_resolve(const std::string & repo_spec, const std::string &
         repo = repo.substr(0, colon);
     }
 
-    std::string gguf_file;
+    std::vector<std::string> candidates;
     if (!file_override.empty()) {
-        gguf_file = file_override;
+        candidates.push_back(file_override);
     } else {
-        // derive filename: strip "-GGUF" suffix from repo basename
+        // derive filename: strip "-GGUF" suffix (case-insensitive), try both quant cases
         std::string basename = repo;
         auto slash = basename.rfind('/');
         if (slash != std::string::npos) basename = basename.substr(slash + 1);
-        if (basename.size() > 5 && basename.substr(basename.size() - 5) == "-GGUF") {
-            basename = basename.substr(0, basename.size() - 5);
+        if (basename.size() > 5) {
+            std::string tail = basename.substr(basename.size() - 5);
+            for (char & c : tail) c = (char)std::toupper((unsigned char)c);
+            if (tail == "-GGUF") basename = basename.substr(0, basename.size() - 5);
         }
-        gguf_file = basename + "-" + quant + ".gguf";
+        candidates.push_back(basename + "-" + quant + ".gguf");
+        std::string lquant = quant;
+        for (char & c : lquant) c = (char)std::tolower((unsigned char)c);
+        if (lquant != quant) candidates.push_back(basename + "-" + lquant + ".gguf");
     }
 
-    fprintf(stderr, "downloading %s/%s ...\n", repo.c_str(), gguf_file.c_str());
-    std::string local_path = hf_download(repo, gguf_file);
-    if (local_path.empty()) {
-        fprintf(stderr, "fatal: failed to download %s from %s\n", gguf_file.c_str(), repo.c_str());
+    for (const auto & gguf_file : candidates) {
+        fprintf(stderr, "downloading %s/%s ...\n", repo.c_str(), gguf_file.c_str());
+        std::string local_path = hf_download(repo, gguf_file);
+        if (!local_path.empty()) return local_path;
     }
-    return local_path;
+    fprintf(stderr, "fatal: failed to download from %s (tried:", repo.c_str());
+    for (const auto & c : candidates) fprintf(stderr, " %s", c.c_str());
+    fprintf(stderr, ")\n");
+    return "";
 }
 
 static void print_usage(const char * program) {
@@ -197,6 +210,11 @@ static void print_usage(const char * program) {
     fprintf(stderr, "  -H,  --host <host>              listen host (default: 127.0.0.1)\n");
     fprintf(stderr, "  -p,  --port <port>              listen port (default: 8080)\n");
     fprintf(stderr, "  -j,  --threads <n>              compute threads (default: 4)\n");
+    fprintf(stderr, "  -V,  --verbose                  print per-stage progress and timing\n");
+    fprintf(stderr, "       --temperature <f>           sampling temperature default (default: 0.9)\n");
+    fprintf(stderr, "       --top-k <n>                 top-k sampling default (default: 50)\n");
+    fprintf(stderr, "       --repetition-penalty <f>    repetition penalty default (default: 1.05)\n");
+    fprintf(stderr, "       --seed <n>                  default sampling seed (default: -1 = random)\n");
     fprintf(stderr, "  -h,  --help                     show this help\n");
 }
 
@@ -221,6 +239,8 @@ static bool parse_args(int argc, char ** argv, server_params & sp) {
         } else if (arg == "-j" || arg == "--threads") {
             if (++i >= argc) { fprintf(stderr, "error: missing threads\n"); return false; }
             sp.n_threads = std::stoi(argv[i]);
+        } else if (arg == "-V" || arg == "--verbose") {
+            sp.verbose = true;
         } else if (arg == "-hf" || arg == "--hf-repo") {
             if (++i >= argc) { fprintf(stderr, "error: missing hf repo\n"); return false; }
             sp.hf_repo = argv[i];
@@ -233,6 +253,18 @@ static bool parse_args(int argc, char ** argv, server_params & sp) {
         } else if (arg == "--hf-file-v") {
             if (++i >= argc) { fprintf(stderr, "error: missing hf vocoder file\n"); return false; }
             sp.hf_file_v = argv[i];
+        } else if (arg == "--temperature") {
+            if (++i >= argc) { fprintf(stderr, "error: missing temperature\n"); return false; }
+            sp.temperature = std::stof(argv[i]);
+        } else if (arg == "--top-k") {
+            if (++i >= argc) { fprintf(stderr, "error: missing top-k\n"); return false; }
+            sp.top_k = std::stoi(argv[i]);
+        } else if (arg == "--repetition-penalty") {
+            if (++i >= argc) { fprintf(stderr, "error: missing repetition-penalty\n"); return false; }
+            sp.repetition_penalty = std::stof(argv[i]);
+        } else if (arg == "--seed") {
+            if (++i >= argc) { fprintf(stderr, "error: missing seed\n"); return false; }
+            sp.seed = std::stoll(argv[i]);
         } else {
             fprintf(stderr, "error: unknown argument: %s\n", arg.c_str());
             return false;
@@ -349,6 +381,19 @@ int main(int argc, char ** argv) {
     // --- POST /v1/audio/voices --- create custom voice from reference audio
     svr.Post("/v1/audio/voices",
         [&tts, &synth_mutex, &voices, &voices_mutex, &next_voice_id](const httplib::Request & req, httplib::Response & res) {
+
+        // runtime audio cloning needs the speaker encoder, which only ships in the Base variant
+        if (!tts.has_speaker_encoder()) {
+            res.status = 400;
+            json err = {{"error", {
+                {"message", "this model variant (" + tts.get_model_type() +
+                            ") does not support voice cloning from audio; "
+                            "use the Base variant, or pick a built-in voice via GET /v1/audio/voices"},
+                {"type", "invalid_request_error"},
+            }}};
+            res.set_content(err.dump(), "application/json");
+            return;
+        }
 
         // expect multipart form: name (string) + audio_sample (file)
         if (!req.has_file("audio_sample")) {
@@ -521,14 +566,15 @@ int main(int argc, char ** argv) {
         std::string voice           = body.value("voice", "");
         std::string instructions    = body.value("instructions", "");
         std::string language        = body.value("language", "en");
-        float       temperature     = body.value("temperature", 0.9f);
-        int         top_k           = body.value("top_k", 50);
-        float       repetition_penalty = body.value("repetition_penalty", 1.05f);
+        float       temperature     = body.value("temperature", sp.temperature);
+        int         top_k           = body.value("top_k", sp.top_k);
+        float       repetition_penalty = body.value("repetition_penalty", sp.repetition_penalty);
+        int64_t     seed               = body.value("seed", sp.seed);
 
-        fprintf(stderr, "request: voice=%s lang=%s fmt=%s temp=%.2f len=%zu\n",
+        fprintf(stderr, "request: voice=%s lang=%s fmt=%s temp=%.2f seed=%lld len=%zu\n",
                 voice.empty() ? "default" : voice.c_str(),
                 language.c_str(), response_format.c_str(),
-                temperature, input.size());
+                temperature, (long long)seed, input.size());
 
         // validate response format
         if (response_format != "wav" && response_format != "pcm") {
@@ -586,9 +632,10 @@ int main(int argc, char ** argv) {
         params.temperature        = temperature;
         params.top_k              = top_k;
         params.repetition_penalty = repetition_penalty;
+        params.seed               = seed;
         params.language_id        = language_to_id(language);
-        params.print_progress     = false;
-        params.print_timing       = false;
+        params.print_progress     = sp.verbose;
+        params.print_timing       = sp.verbose;
         params.instructions       = instructions;
         params.ref_text           = voice_ref_text;
 
@@ -597,10 +644,6 @@ int main(int argc, char ** argv) {
         {
             std::lock_guard<std::mutex> lock(synth_mutex);
             if (!voice_ref_codes.empty()) {
-                // ICL mode: use ref_codes (zero embedding if speaker encoder unavailable)
-                if (voice_embedding.empty()) {
-                    voice_embedding.resize(tts.get_hidden_size(), 0.0f);
-                }
                 result = tts.synthesize_with_embedding(
                     input, voice_embedding.data(), (int32_t)voice_embedding.size(), params,
                     voice_ref_codes.data(), voice_n_ref_frames);

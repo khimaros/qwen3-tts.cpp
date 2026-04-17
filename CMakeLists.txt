@@ -214,6 +214,15 @@ target_link_libraries(test_decoder PRIVATE
     Threads::Threads
 )
 
+# ICL diagnostic dump
+add_executable(test_icl_dump
+    tests/test_icl_dump.cpp
+)
+target_link_libraries(test_icl_dump PRIVATE
+    qwen3_tts
+    Threads::Threads
+)
+
 # Server executable (OpenAI-compatible TTS API)
 if(QWEN3_TTS_SERVER)
     add_executable(qwen3-tts-server

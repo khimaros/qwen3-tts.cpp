@@ -11,6 +11,7 @@ This fork ([khimaros/qwen3-tts.cpp](https://github.com/khimaros/qwen3-tts.cpp)) 
 - **Proper UTF-8 tokenization** via GPT-2 regex pre-tokenization (fixes tokenization of non-ASCII text)
 - **WAVE_FORMAT_EXTENSIBLE** WAV header support (e.g. macOS screen recordings)
 - **GPU-safe vocoder codebook normalization** (unbreaks Vulkan backend)
+- **ICL encoder parity fix**: correct conv-layer bias loading (a subtle `sscanf` partial-match bug silently dropped input-conv and resunit biases), raising encoder/Python cosine similarity from ~0.989 to ~0.99999 per stage and eliminating the ~350ms start-of-audio noise in cloned voices
 - **Performance optimizations**: flash attention for decode steps, static KV cache with `ggml_set_rows`, cached vocoder decoder graph
 - **OpenAI-compatible HTTP server** (`qwen3-tts-server`) with `/v1/audio/speech` and `/v1/audio/voices` endpoints, voice cloning via multipart upload, and `--hf-repo` for auto-downloading models from HuggingFace
 - **Multi-variant model support** (Base / CustomVoice / VoiceDesign) with speaker presets and language IDs stored in GGUF metadata
@@ -71,7 +72,7 @@ uv pip install --upgrade pip
 uv pip install huggingface_hub gguf torch safetensors numpy tqdm coremltools
 
 # Optional if model access requires auth:
-# huggingface-cli login
+# hf auth login
 
 # 5) Download and generate all runtime model artifacts
 python scripts/setup_pipeline_models.py
@@ -156,7 +157,7 @@ Convert HuggingFace models to GGUF format:
 
 ```bash
 # Download the model
-huggingface-cli download Qwen/Qwen3-TTS-12Hz-0.6B-Base \
+hf download Qwen/Qwen3-TTS-12Hz-0.6B-Base \
     --local-dir models/Qwen3-TTS-12Hz-0.6B-Base
 
 # Convert TTS model (transformer + speaker encoder + tokenizer)

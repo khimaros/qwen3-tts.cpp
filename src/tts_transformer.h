@@ -303,6 +303,12 @@ public:
     // Set abort callback checked before each graph compute (thread-safe)
     void set_abort_callback(ggml_abort_callback callback, void * data);
 
+    // Enable per-stage progress prints inside generate() (prefill + decode loop)
+    void set_verbose(bool v) { verbose_ = v; }
+
+    // Reseed the sampling RNG (for reproducible generation).
+    void set_seed(uint64_t seed) { rng_.seed(seed); }
+
     // Check if abort has been requested
     bool is_aborted() const;
     
@@ -373,6 +379,7 @@ private:
     std::string error_msg_;
     ggml_abort_callback abort_cb_ = nullptr;
     void * abort_data_ = nullptr;
+    bool verbose_ = false;
     
     // Cached hidden states from last forward pass
     std::vector<float> last_hidden_;

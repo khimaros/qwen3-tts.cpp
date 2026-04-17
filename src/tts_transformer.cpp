@@ -12,6 +12,7 @@
 #include <unordered_set>
 #include <cstdlib>
 #include <cctype>
+#include <chrono>
 #include <sys/stat.h>
 
 namespace qwen3_tts {
@@ -1274,8 +1275,14 @@ bool TTSTransformer::build_prefill_graph(const int32_t * text_tokens, int32_t n_
         }
 
         // ref_code embeddings: sum across codebooks, overlay with tts_pad
+        const bool skip_ref_codes = std::getenv("QWEN3_TTS_SKIP_REF_CODES") != nullptr;
         std::vector<float> embd_row(hidden_size);
         for (int32_t f = 0; f < n_ref_frames; ++f) {
+            if (skip_ref_codes) {
+                float * dst = icl_codec_section.data() + (size_t)(1 + f) * hidden_size;
+                for (int32_t h = 0; h < hidden_size; ++h) dst[h] = tts_pad_embed[h];
+                continue;
+            }
             float * dst = icl_codec_section.data() + (size_t)(1 + f) * hidden_size;
 
             // sum codebook embeddings for this frame
@@ -2855,6 +2862,11 @@ bool TTSTransformer::generate(const int32_t * text_tokens, int32_t n_tokens,
 #ifdef QWEN3_TTS_TIMING
     t0 = clk::now();
 #endif
+    auto verbose_now_ms = []() {
+        return std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+    };
+    int64_t t_prefill_build_start = verbose_ ? verbose_now_ms() : 0;
     if (!build_prefill_graph(text_tokens, n_tokens, speaker_embd, language_id,
                              prefill_embd, trailing_text_hidden, tts_pad_embed,
                              instruct_tokens, n_instruct_tokens,
@@ -2870,22 +2882,35 @@ bool TTSTransformer::generate(const int32_t * text_tokens, int32_t n_tokens,
     const int32_t prefill_len = (int32_t)(prefill_embd.size() / cfg.hidden_size);
     const int32_t trailing_len = (int32_t)(trailing_text_hidden.size() / cfg.hidden_size);
 
+    if (verbose_) {
+        fprintf(stderr, "  prefill build: %lld ms (prefill_len=%d, trailing_len=%d)\n",
+                (long long)(verbose_now_ms() - t_prefill_build_start), prefill_len, trailing_len);
+    }
+
     const int32_t required_ctx = prefill_len + max_len + 8;
     if (state_.cache.n_ctx < required_ctx || state_.cache.n_ctx > std::max<int32_t>(required_ctx * 2, 512)) {
+        if (verbose_) {
+            fprintf(stderr, "  init kv cache: n_ctx=%d\n", required_ctx);
+        }
         if (!init_kv_cache(required_ctx)) {
             return false;
         }
     }
     clear_kv_cache();
-    
+
     std::vector<float> hidden_out;
     std::vector<float> logits;
 
 #ifdef QWEN3_TTS_TIMING
     t0 = clk::now();
 #endif
+    int64_t t_prefill_fwd_start = verbose_ ? verbose_now_ms() : 0;
     if (!forward_prefill(prefill_embd.data(), prefill_len, 0, hidden_out, &logits)) {
         return false;
+    }
+    if (verbose_) {
+        fprintf(stderr, "  prefill forward: %lld ms\n",
+                (long long)(verbose_now_ms() - t_prefill_fwd_start));
     }
 #ifdef QWEN3_TTS_TIMING
     t1 = clk::now();
@@ -2899,15 +2924,39 @@ bool TTSTransformer::generate(const int32_t * text_tokens, int32_t n_tokens,
     std::vector<int32_t> frame_codes(cfg.n_codebooks);
     std::unordered_set<int32_t> generated_cb0_tokens;
     const int32_t suppress_start = cfg.codec_vocab_size - 1024;
-    
+
     std::vector<float> probs(cfg.codec_vocab_size);
     std::vector<float> step_embd(cfg.hidden_size, 0.0f);
     std::vector<float> embd_row(cfg.hidden_size);
-    
+
+    int64_t t_decode_start = verbose_ ? verbose_now_ms() : 0;
+    int64_t t_decode_last = t_decode_start;
+
     for (int frame = 0; frame < max_len; ++frame) {
+        if (verbose_ && frame > 0 && frame % 25 == 0) {
+            int64_t now = verbose_now_ms();
+            fprintf(stderr, "  decode: frame %d/%d (last 25 frames in %lld ms, total %lld ms)\n",
+                    frame, max_len, (long long)(now - t_decode_last), (long long)(now - t_decode_start));
+            t_decode_last = now;
+        }
         if (is_aborted()) {
             error_msg_ = "Aborted";
             return false;
+        }
+        // ICL diagnostic: log top-5 cb0 logits and last_hidden_ norm for first 5 frames
+        if (frame < 5 && std::getenv("QWEN3_TTS_DUMP_LOGITS")) {
+            double hnorm = 0.0;
+            for (int h = 0; h < cfg.hidden_size; ++h) hnorm += (double)last_hidden_[h] * last_hidden_[h];
+            hnorm = std::sqrt(hnorm);
+            std::vector<std::pair<float, int32_t>> sc(cfg.codec_vocab_size);
+            for (int32_t i = 0; i < cfg.codec_vocab_size; ++i) sc[i] = {logits[i], i};
+            std::partial_sort(sc.begin(), sc.begin() + 5, sc.end(),
+                [](const auto & a, const auto & b) { return a.first > b.first; });
+            fprintf(stderr, "  [diag f%d] n_past=%d hnorm=%.4f hidden[0..4]=%.4f,%.4f,%.4f,%.4f,%.4f top5_cb0=",
+                    frame, n_past, hnorm,
+                    last_hidden_[0], last_hidden_[1], last_hidden_[2], last_hidden_[3], last_hidden_[4]);
+            for (int i = 0; i < 5; ++i) fprintf(stderr, " %d(%.3f)", sc[i].second, sc[i].first);
+            fprintf(stderr, "\n");
         }
         // Suppress tokens in [codec_vocab_size - 1024, codec_vocab_size), except codec_eos_id
         for (int32_t i = suppress_start; i < cfg.codec_vocab_size; ++i) {

@@ -104,7 +104,7 @@ class Qwen3TTSTokenizerConverter:
         (r"encoder\.encoder_transformer\.layers\.(\d+)\.mlp\.fc2\.weight", "tok_enc.blk.{}.ffn_down.weight"),
         (r"encoder\.encoder_transformer\.layers\.(\d+)\.mlp_layer_scale\.scale", "tok_enc.blk.{}.ffn_scale"),
         
-        # Encoder acoustic quantizer codebooks (embed_sum is the actual codebook)
+        # Encoder acoustic quantizer codebooks (embed_sum / cluster_usage = codebook)
         (r"encoder\.quantizer\.acoustic_residual_vector_quantizer\.layers\.(\d+)\.codebook\.embed_sum", "tok_enc.vq_acoustic.{}.codebook"),
         (r"encoder\.quantizer\.acoustic_residual_vector_quantizer\.layers\.(\d+)\.codebook\.cluster_usage", "tok_enc.vq_acoustic.{}.usage"),
         (r"encoder\.quantizer\.acoustic_residual_vector_quantizer\.layers\.(\d+)\.codebook\.initialized", "tok_enc.vq_acoustic.{}.initialized"),
@@ -320,25 +320,31 @@ class Qwen3TTSTokenizerConverter:
         skipped_count = 0
         skipped_tensors = []
         
-        # Collect embedding_sum and cluster_usage pairs for codebook computation
+        # Codebooks are stored in HF as `embed_sum` (encoder) or `embedding_sum` (decoder)
+        # paired with `cluster_usage`. The real codebook is sum / usage.clamp(min=eps).
+        SUM_SUFFIXES = ("embedding_sum", "embed_sum")
+
+        def find_sum_suffix(name: str) -> str | None:
+            # Check longer suffix first so `embedding_sum` doesn't get misread as `embed_sum`.
+            for s in SUM_SUFFIXES:
+                if s in name:
+                    return s
+            return None
+
         codebook_pairs: dict[str, dict[str, torch.Tensor]] = {}
 
         logger.info("Processing tensors...")
         all_tensors = list(self._get_tensors())
-        
-        # First pass: collect codebook pairs
+
         for hf_name, tensor in all_tensors:
-            if "embedding_sum" in hf_name:
-                base_name = hf_name.replace("embedding_sum", "")
-                if base_name not in codebook_pairs:
-                    codebook_pairs[base_name] = {}
-                codebook_pairs[base_name]["embedding_sum"] = tensor
+            suffix = find_sum_suffix(hf_name)
+            if suffix:
+                base_name = hf_name.replace(suffix, "")
+                codebook_pairs.setdefault(base_name, {})["embedding_sum"] = tensor
             elif "cluster_usage" in hf_name:
                 base_name = hf_name.replace("cluster_usage", "")
-                if base_name not in codebook_pairs:
-                    codebook_pairs[base_name] = {}
-                codebook_pairs[base_name]["cluster_usage"] = tensor
-        
+                codebook_pairs.setdefault(base_name, {})["cluster_usage"] = tensor
+
         for hf_name, tensor in tqdm(all_tensors, desc="Converting"):
             ggml_name = self._map_tensor_name(hf_name)
 
@@ -346,20 +352,22 @@ class Qwen3TTSTokenizerConverter:
                 skipped_tensors.append(hf_name)
                 skipped_count += 1
                 continue
-            
-            # Skip cluster_usage tensors (we'll use them to compute codebooks)
+
+            # cluster_usage is only used to compute the codebook, not written directly.
             if "cluster_usage" in hf_name:
                 skipped_count += 1
                 continue
-            
-            # For embedding_sum, compute actual codebook = embedding_sum / cluster_usage
-            if "embedding_sum" in hf_name:
-                base_name = hf_name.replace("embedding_sum", "")
+
+            suffix = find_sum_suffix(hf_name)
+            if suffix:
+                base_name = hf_name.replace(suffix, "")
                 if base_name in codebook_pairs and "cluster_usage" in codebook_pairs[base_name]:
                     embedding_sum = codebook_pairs[base_name]["embedding_sum"]
                     cluster_usage = codebook_pairs[base_name]["cluster_usage"]
                     tensor = embedding_sum / cluster_usage.clamp(min=1e-5).unsqueeze(1)
-                    logger.debug(f"  Computing codebook from embedding_sum/cluster_usage for {hf_name}")
+                    logger.debug(f"  Computing codebook from {suffix}/cluster_usage for {hf_name}")
+                else:
+                    logger.warning(f"  No cluster_usage paired with {hf_name}; writing raw {suffix}")
 
             # Convert tensor
             data, dtype = self._convert_dtype(tensor, ggml_name)

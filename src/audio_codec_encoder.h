@@ -80,11 +80,13 @@ struct codec_encoder_model {
     // VQ semantic (1 codebook)
     struct ggml_tensor * vq_sem_in_proj = nullptr;   // [256, 512, 1] 1x1 conv
     struct ggml_tensor * vq_sem_codebook = nullptr;  // [2048, 256]
+    struct ggml_tensor * vq_sem_usage = nullptr;     // [2048] cluster_usage
     struct ggml_tensor * vq_sem_out_proj = nullptr;  // [512, 256, 1]
 
     // VQ acoustic (15 codebooks for TTS, 31 total stored)
     struct ggml_tensor * vq_acou_in_proj = nullptr;
     struct ggml_tensor * vq_acou_codebook[31] = {};
+    struct ggml_tensor * vq_acou_usage[31]    = {};
     struct ggml_tensor * vq_acou_out_proj = nullptr;
 
     struct ggml_context * ctx = nullptr;

@@ -108,17 +108,33 @@ Qwen3TTS::Qwen3TTS() = default;
 Qwen3TTS::~Qwen3TTS() = default;
 
 bool Qwen3TTS::load_models(const std::string & model_dir) {
-    // prefer quantized (q8_0) over full-precision (f16)
-    std::string tts_path;
-    std::string q8_path = model_dir + "/qwen3-tts-0.6b-q8_0.gguf";
-    FILE * q8_check = fopen(q8_path.c_str(), "r");
-    if (q8_check) {
-        fclose(q8_check);
-        tts_path = q8_path;
-    } else {
-        tts_path = model_dir + "/qwen3-tts-0.6b-f16.gguf";
+    // discover talker (any *.gguf not matching tokenizer) and vocoder (*tokenizer*.gguf).
+    // prefer q8_0 over f16 for talker.
+    namespace fs = std::filesystem;
+    std::string tts_path, vocoder_path;
+    std::string tts_q8, tts_f16, tts_other;
+    std::error_code ec;
+    for (const auto & entry : fs::directory_iterator(model_dir, ec)) {
+        if (ec || !entry.is_regular_file()) continue;
+        std::string name = entry.path().filename().string();
+        if (name.size() < 5 || name.substr(name.size() - 5) != ".gguf") continue;
+        std::string lower = name;
+        for (auto & c : lower) c = (char)std::tolower((unsigned char)c);
+        if (lower.find("tokenizer") != std::string::npos) {
+            vocoder_path = entry.path().string();
+        } else if (lower.find("q8_0") != std::string::npos) {
+            tts_q8 = entry.path().string();
+        } else if (lower.find("f16") != std::string::npos || lower.find("fp16") != std::string::npos) {
+            tts_f16 = entry.path().string();
+        } else {
+            tts_other = entry.path().string();
+        }
     }
-    std::string vocoder_path = model_dir + "/qwen3-tts-tokenizer-f16.gguf";
+    tts_path = !tts_q8.empty() ? tts_q8 : (!tts_f16.empty() ? tts_f16 : tts_other);
+    if (tts_path.empty() || vocoder_path.empty()) {
+        error_msg_ = "could not find talker and tokenizer ggufs in " + model_dir;
+        return false;
+    }
     return load_model_files(tts_path, vocoder_path);
 }
 
@@ -227,7 +243,7 @@ tts_result Qwen3TTS::synthesize(const std::string & text,
     // For basic synthesis without voice cloning, we use a zero speaker embedding
     // This will use the model's default voice characteristics
     std::vector<float> zero_embedding(transformer_.get_config().hidden_size, 0.0f);
-    
+
     return synthesize_internal(text, zero_embedding.data(), params, result);
 }
 
@@ -507,13 +523,22 @@ tts_result Qwen3TTS::synthesize_internal(const std::string & text,
         }
     }
     transformer_.clear_kv_cache();
-    
+    transformer_.set_verbose(params.print_progress);
+    if (params.seed >= 0) {
+        transformer_.set_seed((uint64_t)params.seed);
+    }
+
     // tokenize ref_text for ICL mode
     std::vector<int32_t> ref_text_tokens;
     if (ref_codes && n_ref_frames > 0 && !params.ref_text.empty()) {
         ref_text_tokens = tokenizer_.encode_for_tts(params.ref_text);
-        // extract content tokens only (skip role prefix and suffix)
-        // format: [role0, role1, role2, content..., suffix0..suffix4]
+        // python _build_ref_text wraps as <|im_start|>assistant\n{text}<|im_end|>\n
+        // and slices ref_id[:, 3:-2], yielding just the content tokens. our
+        // encode_for_tts uses the longer assistant wrap with a trailing
+        // <|im_start|>assistant\n (8 framing tokens), so we drop 3 prefix + 5
+        // suffix tokens to land on the same content-only window. leaving the
+        // boundary tokens in causes the talker to treat ref+new as separate
+        // turns, producing hangs and ref-text interjection.
         if ((int)ref_text_tokens.size() > 8) {
             ref_text_tokens = std::vector<int32_t>(
                 ref_text_tokens.begin() + 3,
@@ -584,9 +609,54 @@ tts_result Qwen3TTS::synthesize_internal(const std::string & text,
         }
     }
     
-    if (!audio_decoder_.decode(speech_codes.data(), n_frames, result.audio)) {
+    // ICL: prepend ref_codes to the talker output so the vocoder has warm
+    // context (matches qwen3_tts_model.py:616, torch.cat([ref, new])). We then
+    // slice the ref portion off the decoded wav below. Without this, the
+    // vocoder cold-starts and produces ~350ms of noise at the beginning.
+    std::vector<int32_t> codes_for_decode;
+    int32_t total_frames = n_frames;
+    if (ref_codes && n_ref_frames > 0 && !params.ref_text.empty()) {
+        total_frames = n_ref_frames + n_frames;
+        codes_for_decode.resize((size_t)total_frames * n_codebooks);
+        std::memcpy(codes_for_decode.data(),
+                    ref_codes,
+                    (size_t)n_ref_frames * n_codebooks * sizeof(int32_t));
+        std::memcpy(codes_for_decode.data() + (size_t)n_ref_frames * n_codebooks,
+                    speech_codes.data(),
+                    speech_codes.size() * sizeof(int32_t));
+    }
+    const int32_t * decode_codes =
+        codes_for_decode.empty() ? speech_codes.data() : codes_for_decode.data();
+    fprintf(stderr, "  [icl] ref_frames=%d new_frames=%d total_frames=%d prepended=%d\n",
+            n_ref_frames, n_frames, total_frames, (int)!codes_for_decode.empty());
+    if (const char * dp = std::getenv("QWEN3_TTS_DUMP_CODES")) {
+        FILE * fp = fopen(dp, "wb");
+        if (fp) {
+            int32_t hdr[3] = { n_ref_frames, n_frames, n_codebooks };
+            fwrite(hdr, sizeof(int32_t), 3, fp);
+            if (ref_codes && n_ref_frames > 0) {
+                fwrite(ref_codes, sizeof(int32_t), (size_t)n_ref_frames * n_codebooks, fp);
+            }
+            fwrite(speech_codes.data(), sizeof(int32_t), speech_codes.size(), fp);
+            fclose(fp);
+            fprintf(stderr, "  dumped ref+new codes to %s\n", dp);
+        }
+    }
+
+    if (!audio_decoder_.decode(decode_codes, total_frames, result.audio)) {
         result.error_msg = "Failed to decode speech codes: " + audio_decoder_.get_error();
         return result;
+    }
+
+    // trim the ref-code portion from the decoded wav (qwen3_tts_model.py:628).
+    if (!codes_for_decode.empty() && !result.audio.empty()) {
+        size_t total_samples = result.audio.size();
+        size_t cut = (size_t)(((int64_t)n_ref_frames * (int64_t)total_samples)
+                               / (int64_t)total_frames);
+        if (cut < total_samples) {
+            result.audio.erase(result.audio.begin(),
+                               result.audio.begin() + (ptrdiff_t)cut);
+        }
     }
     result.t_decode_ms = get_time_ms() - t_decode_start;
     sample_memory("synth/after-decode");
