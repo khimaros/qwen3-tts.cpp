@@ -144,6 +144,23 @@ static std::string wav_streaming_header(int sample_rate) {
     return buf;
 }
 
+// http content type for a response_format
+static const char * content_type_for(const std::string & fmt) {
+    if (fmt == "mp3")  return "audio/mpeg";
+    if (fmt == "opus") return "audio/ogg";
+    if (fmt == "pcm")  return "audio/pcm";
+    return "audio/wav";
+}
+
+// encode a full result into a self-contained byte buffer for the chosen format
+static std::string encode_format(const std::string & fmt,
+                                 const std::vector<float> & samples, int sample_rate) {
+    audio_codec codec;
+    if (codec_from_name(fmt, codec)) return encode_compressed(codec, samples, sample_rate);
+    if (fmt == "pcm") return encode_pcm(samples);
+    return encode_wav(samples, sample_rate);
+}
+
 // minimal RFC 4648 base64 encoder (no line wrapping)
 static std::string base64_encode(const char * data, size_t len) {
     static const char tbl[] =
@@ -718,11 +735,23 @@ int main(int argc, char ** argv) {
         }
 
         // validate response format
-        if (response_format != "wav" && response_format != "pcm") {
+        if (response_format != "wav" && response_format != "pcm" &&
+            response_format != "mp3" && response_format != "opus") {
             res.status = 400;
             json err = {{"error", {
                 {"message", "unsupported response_format '" + response_format +
-                            "', supported: wav, pcm"},
+                            "', supported: wav, pcm, mp3, opus"},
+                {"type", "invalid_request_error"},
+            }}};
+            res.set_content(err.dump(), "application/json");
+            return;
+        }
+        audio_codec response_codec;
+        if (codec_from_name(response_format, response_codec) && !compressed_audio_supported()) {
+            res.status = 400;
+            json err = {{"error", {
+                {"message", "response_format '" + response_format + "' is not available: "
+                            "server built without libav/ffmpeg"},
                 {"type", "invalid_request_error"},
             }}};
             res.set_content(err.dump(), "application/json");
@@ -801,8 +830,10 @@ int main(int argc, char ** argv) {
         if (live_stream) {
             const bool is_sse = (stream_format == "sse");
             const bool is_wav = (response_format == "wav");
+            audio_codec stream_codec;
+            const bool is_compressed = codec_from_name(response_format, stream_codec);
             const char * ctype = is_sse ? "text/event-stream"
-                                        : (is_wav ? "audio/wav" : "audio/pcm");
+                                        : content_type_for(response_format);
 
             // capture synthesis inputs; move into provider lambda below.
             res.set_chunked_content_provider(ctype,
@@ -810,13 +841,13 @@ int main(int argc, char ** argv) {
                  voice_embedding = std::move(voice_embedding),
                  voice_ref_codes = std::move(voice_ref_codes),
                  voice_n_ref_frames,
-                 stream_batch_size, is_sse, is_wav,
+                 stream_batch_size, is_sse, is_wav, is_compressed, stream_codec,
                  synth_mutex = &synth_mutex, sample_rate_fallback = 24000]
                 (size_t /*offset*/, httplib::DataSink & sink) mutable -> bool {
                     std::lock_guard<std::mutex> lock(*synth_mutex);
 
-                    // wav header up front (audio mode only). for SSE, the wav
-                    // bytes per-delta are raw pcm — clients reconstruct wav.
+                    // wav header up front (audio mode only). for SSE, the per-delta
+                    // bytes are raw pcm/mp3/opus — clients reconstruct the container.
                     bool header_written = false;
                     auto ensure_header = [&]() {
                         if (!header_written && !is_sse && is_wav) {
@@ -826,11 +857,10 @@ int main(int argc, char ** argv) {
                         header_written = true;
                     };
 
-                    streaming_opts sopts;
-                    sopts.batch_size = stream_batch_size;
-                    sopts.on_pcm = [&](const float * pcm, size_t n) -> bool {
-                        ensure_header();
-                        std::string bytes = encode_pcm(std::vector<float>(pcm, pcm + n));
+                    // write a chunk of already-encoded bytes, as an sse delta or
+                    // raw to the wire; empty chunks are skipped (muxer buffers).
+                    auto emit = [&](const std::string & bytes) -> bool {
+                        if (bytes.empty()) return true;
                         if (is_sse) {
                             json delta = {
                                 {"type", "speech.audio.delta"},
@@ -841,6 +871,17 @@ int main(int argc, char ** argv) {
                             return sink.write(frame.data(), frame.size());
                         }
                         return sink.write(bytes.data(), bytes.size());
+                    };
+
+                    compressed_encoder * enc = is_compressed
+                        ? compressed_encoder_open(stream_codec, sample_rate_fallback) : nullptr;
+
+                    streaming_opts sopts;
+                    sopts.batch_size = stream_batch_size;
+                    sopts.on_pcm = [&](const float * pcm, size_t n) -> bool {
+                        if (enc) return emit(compressed_encoder_write(enc, pcm, n));
+                        ensure_header();
+                        return emit(encode_pcm(std::vector<float>(pcm, pcm + n)));
                     };
 
                     tts_result result;
@@ -856,8 +897,13 @@ int main(int argc, char ** argv) {
                         result = this_tts->synthesize(input, params, &sopts);
                     }
 
-                    // ensure a header went out even if no pcm was produced.
+                    // ensure a header went out even if no pcm was produced, and
+                    // flush any frames the muxer still holds.
                     ensure_header();
+                    if (enc) {
+                        emit(compressed_encoder_flush(enc));
+                        compressed_encoder_close(enc);
+                    }
 
                     if (is_sse) {
                         std::string done_frame = "event: speech.audio.done\ndata: "
@@ -909,22 +955,22 @@ int main(int argc, char ** argv) {
 
         // one-shot (no stream_format): preserve legacy behavior
         if (stream_format.empty()) {
-            if (response_format == "pcm") {
-                res.set_content(encode_pcm(result.audio), "audio/pcm");
-            } else {
-                res.set_content(encode_wav(result.audio, result.sample_rate), "audio/wav");
-            }
+            res.set_content(encode_format(response_format, result.audio, result.sample_rate),
+                            content_type_for(response_format));
             return;
         }
 
         // stream_format=audio: raw chunked bytes in the chosen response_format.
-        // wav uses a placeholder-size header so playback can start immediately.
+        // wav uses a placeholder-size header so playback can start immediately;
+        // pcm/mp3 need no container header so the body carries the full encoding.
         if (stream_format == "audio") {
             std::string header = (response_format == "wav")
                 ? wav_streaming_header(result.sample_rate)
                 : std::string();
-            std::string body_bytes = encode_pcm(result.audio);
-            const char * ctype = (response_format == "wav") ? "audio/wav" : "audio/pcm";
+            std::string body_bytes = (response_format == "wav")
+                ? encode_pcm(result.audio)
+                : encode_format(response_format, result.audio, result.sample_rate);
+            const char * ctype = content_type_for(response_format);
 
             res.set_chunked_content_provider(ctype,
                 [header = std::move(header), body_bytes = std::move(body_bytes)]
@@ -940,13 +986,11 @@ int main(int argc, char ** argv) {
         }
 
         // stream_format=sse: emit speech.audio.delta + speech.audio.done.
-        // response_format still selects the bytes carried inside delta (wav or
-        // pcm). usage/timings on the done event are shaped to be consumed by
+        // response_format still selects the bytes carried inside delta (wav, pcm,
+        // or mp3). usage/timings on the done event are shaped to be consumed by
         // both openai clients and llama-swap's metrics_monitor.
         {
-            std::string audio_bytes = (response_format == "wav")
-                ? encode_wav(result.audio, result.sample_rate)
-                : encode_pcm(result.audio);
+            std::string audio_bytes = encode_format(response_format, result.audio, result.sample_rate);
 
             json delta = {
                 {"type", "speech.audio.delta"},

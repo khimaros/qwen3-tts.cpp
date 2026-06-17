@@ -13,7 +13,7 @@ This fork ([khimaros/qwen3-tts.cpp](https://github.com/khimaros/qwen3-tts.cpp)) 
 - **GPU-safe vocoder codebook normalization** (unbreaks Vulkan backend)
 - **ICL encoder parity fix**: correct conv-layer bias loading (a subtle `sscanf` partial-match bug silently dropped input-conv and resunit biases), raising encoder/Python cosine similarity from ~0.989 to ~0.99999 per stage and eliminating the ~350ms start-of-audio noise in cloned voices
 - **Performance optimizations**: flash attention for decode steps, static KV cache with `ggml_set_rows`, cached vocoder decoder graph
-- **OpenAI-compatible HTTP server** (`qwen3-tts-server`) with `/v1/audio/speech` and `/v1/audio/voices` endpoints, voice cloning via multipart upload, and `--hf-repo` for auto-downloading GGUFs from the [Qwen3-TTS collection](https://huggingface.co/collections/khimaros/qwen3-tts)
+- **OpenAI-compatible HTTP server** (`qwen3-tts-server`) with `/v1/audio/speech` and `/v1/audio/voices` endpoints, voice cloning via multipart upload, and `--hf-repo` for auto-downloading GGUFs from the [Qwen3-TTS collection](https://huggingface.co/collections/khimaros/qwen3-tts). `response_format` accepts `wav`, `pcm`, `mp3`, and `opus` (mp3/opus require a build with libav/ffmpeg)
 - **Streaming audio output**: chunked vocoder decode with causal tails, per-layer KV rolling, and conv-transpose overlap state, so PCM is emitted frame-by-frame while the transformer is still generating. Exposed via the CLI `--streaming-batch-size N` flag and wired through the server for live HTTP responses; parity-tested against one-shot decode
 - **Real token accounting** in `tts_result` (text / prefill / audio tokens, plus prefill time broken out of total generate time) for accurate OpenAI `usage` reporting
 - **Multi-variant model support** (Base / CustomVoice / VoiceDesign) with speaker presets and language IDs stored in GGUF metadata
@@ -161,6 +161,16 @@ cmake --build build -j4
 
 > **Note:** The top-level CMake currently expects GGML in `./ggml` with libraries under `./ggml/build/src`.
 
+### Optional: mp3 / opus output
+
+Compressed audio output (mp3 and ogg/opus) is enabled automatically when the
+libav/ffmpeg dev libraries (`libavformat`, `libavcodec`, `libavutil`,
+`libswresample`) are found at configure time; builds without them succeed and
+simply omit the compressed formats. To enable it, install the dev packages
+before configuring (for example `sudo apt install libavformat-dev libavcodec-dev
+libavutil-dev libswresample-dev`, or `brew install ffmpeg`). Configure prints
+`compressed audio (mp3/opus): enabled` or `disabled`.
+
 ## Model Setup (Recommended)
 
 Use the one-shot setup script:
@@ -204,6 +214,10 @@ Place both `.gguf` files in a `models/` directory.
 # Basic synthesis
 ./build/qwen3-tts-cli -m models -t "Hello, world!" -o hello.wav
 
+# mp3 / opus output (requires a build with libav/ffmpeg; see Build)
+./build/qwen3-tts-cli -m models -t "Hello, world!" -o hello.mp3
+./build/qwen3-tts-cli -m models -t "Hello, world!" -o hello.opus
+
 # Voice cloning from reference audio
 ./build/qwen3-tts-cli -m models -t "Hello! How are you?" -r reference.wav -o cloned.wav
 
@@ -218,7 +232,7 @@ Place both `.gguf` files in a `models/` directory.
 |------|-------------|---------|
 | `-m, --model <dir>` | Model directory containing GGUF files | (required) |
 | `-t, --text <text>` | Text to synthesize | (required) |
-| `-o, --output <file>` | Output WAV file path | `output.wav` |
+| `-o, --output <file>` | Output file path; `.wav`, or `.mp3`/`.opus` when built with libav | `output.wav` |
 | `-r, --reference <file>` | Reference audio for voice cloning | (none) |
 | `--temperature <val>` | Sampling temperature (0 = greedy) | 0.9 |
 | `--top-k <n>` | Top-k sampling (0 = disabled) | 50 |

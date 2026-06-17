@@ -44,6 +44,7 @@ qwen3-tts.cpp/
 - Build project: `cmake -S . -B build && cmake --build build -j4`
 - Timing build: `cmake -S . -B build -DQWEN3_TTS_TIMING=ON && cmake --build build -j4`
 - GGML headers are in `./ggml/include`
+- compressed audio output (mp3, ogg/opus) is auto-enabled when the libav/ffmpeg dev libs are found via pkg-config (defines `QWEN3_TTS_LIBAV`, links `PkgConfig::LIBAV`); builds without them succeed and omit the compressed formats. The encoder lives in `qwen3_tts.{h,cpp}` (`encode_compressed`, `compressed_encoder_*`, `compressed_audio_supported`, `codec_from_name`) and muxes in-memory through a custom non-seekable AVIO
 
 ## Coding Conventions
 

@@ -18,6 +18,18 @@
 #include <sys/resource.h>
 #endif
 
+#ifdef QWEN3_TTS_LIBAV
+extern "C" {
+#include <libavformat/avformat.h>
+#include <libavcodec/avcodec.h>
+#include <libavutil/audio_fifo.h>
+#include <libavutil/channel_layout.h>
+#include <libavutil/opt.h>
+#include <libavutil/samplefmt.h>
+#include <libswresample/swresample.h>
+}
+#endif
+
 namespace qwen3_tts {
 
 static int64_t get_time_ms() {
@@ -1041,8 +1053,8 @@ bool load_audio_file(const std::string & path, std::vector<float> & samples,
 }
 
 // WAV file saving (16-bit PCM at specified sample rate)
-bool save_audio_file(const std::string & path, const std::vector<float> & samples,
-                     int sample_rate) {
+static bool save_wav_file(const std::string & path, const std::vector<float> & samples,
+                          int sample_rate) {
     FILE * f = fopen(path.c_str(), "wb");
     if (!f) {
         fprintf(stderr, "ERROR: Cannot create WAV file: %s\n", path.c_str());
@@ -1088,9 +1100,287 @@ bool save_audio_file(const std::string & path, const std::vector<float> & sample
         int16_t pcm_sample = (int16_t)(sample * 32767.0f);
         fwrite(&pcm_sample, 2, 1, f);
     }
-    
+
     fclose(f);
     return true;
+}
+
+bool compressed_audio_supported() {
+#ifdef QWEN3_TTS_LIBAV
+    return true;
+#else
+    return false;
+#endif
+}
+
+bool codec_from_name(const std::string & name, audio_codec & out) {
+    if (name == "mp3") { out = audio_codec::mp3; return true; }
+    if (name == "opus" || name == "ogg") { out = audio_codec::opus; return true; }
+    return false;
+}
+
+#ifdef QWEN3_TTS_LIBAV
+
+// in-memory libav muxing: the encoder feeds float pcm through a resampler into a
+// frame-size fifo, encodes full frames, and muxes packets to a custom non-
+// seekable AVIO whose write callback appends to `pending`. callers drain
+// `pending` from the _write/_flush return values, so the same path serves both
+// one-shot and streaming output. mp3 disables the xing/id3 tags so no seek is
+// needed; ogg/opus is streamable by nature.
+static constexpr int LIBAV_IO_BUFSZ = 4096;
+
+struct compressed_encoder {
+    AVFormatContext * fmt   = nullptr;
+    AVCodecContext  * cctx  = nullptr;
+    AVStream        * st    = nullptr;
+    AVIOContext     * avio  = nullptr;
+    SwrContext      * swr   = nullptr;
+    AVAudioFifo     * fifo  = nullptr;
+    AVFrame         * frame = nullptr;
+    AVPacket        * pkt   = nullptr;
+    std::string       pending;
+    int               frame_size = 0;
+    int64_t           pts = 0;
+};
+
+static int libav_write_cb(void * opaque, const uint8_t * buf, int size) {
+    auto * e = static_cast<compressed_encoder *>(opaque);
+    e->pending.append(reinterpret_cast<const char *>(buf), (size_t)size);
+    return size;
+}
+
+static std::string take_pending(compressed_encoder * e) {
+    std::string out;
+    out.swap(e->pending);
+    return out;
+}
+
+// pull encoded packets and mux them; returns 0 or a negative libav error.
+static int libav_mux_packets(compressed_encoder * e) {
+    for (;;) {
+        int r = avcodec_receive_packet(e->cctx, e->pkt);
+        if (r == AVERROR(EAGAIN) || r == AVERROR_EOF) return 0;
+        if (r < 0) return r;
+        e->pkt->stream_index = e->st->index;
+        av_packet_rescale_ts(e->pkt, e->cctx->time_base, e->st->time_base);
+        r = av_interleaved_write_frame(e->fmt, e->pkt);
+        av_packet_unref(e->pkt);
+        if (r < 0) return r;
+    }
+}
+
+// encode whole frames from the fifo; on final, pad the tail frame and drain.
+static int libav_encode_fifo(compressed_encoder * e, bool final_flush) {
+    const int fs = e->frame_size;
+    const int ch = e->cctx->ch_layout.nb_channels;
+    while (av_audio_fifo_size(e->fifo) >= fs) {
+        if (av_frame_make_writable(e->frame) < 0) return -1;
+        av_audio_fifo_read(e->fifo, (void **)e->frame->data, fs);
+        e->frame->nb_samples = fs;
+        e->frame->pts = e->pts; e->pts += fs;
+        int r = avcodec_send_frame(e->cctx, e->frame);
+        if (r < 0 || (r = libav_mux_packets(e)) < 0) return r;
+    }
+    if (!final_flush) return 0;
+
+    int rem = av_audio_fifo_size(e->fifo);
+    if (rem > 0) {
+        if (av_frame_make_writable(e->frame) < 0) return -1;
+        av_audio_fifo_read(e->fifo, (void **)e->frame->data, rem);
+        if (rem < fs)  // pad to a full frame: fixed-size encoders reject partials
+            av_samples_set_silence(e->frame->data, rem, fs - rem, ch, e->cctx->sample_fmt);
+        e->frame->nb_samples = fs;
+        e->frame->pts = e->pts; e->pts += rem;
+        int r = avcodec_send_frame(e->cctx, e->frame);
+        if (r < 0 || (r = libav_mux_packets(e)) < 0) return r;
+    }
+    avcodec_send_frame(e->cctx, nullptr);  // flush the encoder
+    return libav_mux_packets(e);
+}
+
+compressed_encoder * compressed_encoder_open(audio_codec codec, int sample_rate) {
+    av_log_set_level(AV_LOG_ERROR);
+
+    const char * muxer; const char * enc_name; enum AVCodecID fallback; int bitrate;
+    if (codec == audio_codec::mp3) {
+        muxer = "mp3";  enc_name = "libmp3lame"; fallback = AV_CODEC_ID_MP3;  bitrate = MP3_BITRATE;
+    } else {
+        muxer = "ogg";  enc_name = "libopus";    fallback = AV_CODEC_ID_OPUS; bitrate = OPUS_BITRATE;
+    }
+
+    const AVCodec * encoder = avcodec_find_encoder_by_name(enc_name);
+    if (!encoder) encoder = avcodec_find_encoder(fallback);
+    if (!encoder) return nullptr;
+
+    auto * e = new compressed_encoder();
+    if (avformat_alloc_output_context2(&e->fmt, nullptr, muxer, nullptr) < 0 || !e->fmt) {
+        compressed_encoder_close(e); return nullptr;
+    }
+
+    unsigned char * iobuf = (unsigned char *)av_malloc(LIBAV_IO_BUFSZ);
+    if (!iobuf) { compressed_encoder_close(e); return nullptr; }
+    e->avio = avio_alloc_context(iobuf, LIBAV_IO_BUFSZ, 1, e, nullptr, libav_write_cb, nullptr);
+    if (!e->avio) { av_free(iobuf); compressed_encoder_close(e); return nullptr; }
+    e->avio->seekable = 0;
+    e->fmt->pb = e->avio;
+    e->fmt->flags |= AVFMT_FLAG_CUSTOM_IO;
+
+    e->cctx = avcodec_alloc_context3(encoder);
+    if (!e->cctx) { compressed_encoder_close(e); return nullptr; }
+
+    // pick a sample format the encoder supports, preferring float.
+    const enum AVSampleFormat * sfmts = nullptr;
+    int n_sfmts = 0;
+    avcodec_get_supported_config(nullptr, encoder, AV_CODEC_CONFIG_SAMPLE_FORMAT, 0,
+                                 (const void **)&sfmts, &n_sfmts);
+    enum AVSampleFormat want = (sfmts && n_sfmts > 0) ? sfmts[0] : AV_SAMPLE_FMT_FLTP;
+    for (int i = 0; sfmts && i < n_sfmts; i++) {
+        if (sfmts[i] == AV_SAMPLE_FMT_FLT || sfmts[i] == AV_SAMPLE_FMT_FLTP) { want = sfmts[i]; break; }
+    }
+
+    e->cctx->sample_fmt  = want;
+    e->cctx->sample_rate = sample_rate;
+    av_channel_layout_default(&e->cctx->ch_layout, 1);  // mono
+    e->cctx->bit_rate  = bitrate;
+    e->cctx->time_base = av_make_q(1, sample_rate);
+    if (e->fmt->oformat->flags & AVFMT_GLOBALHEADER)
+        e->cctx->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
+
+    if (avcodec_open2(e->cctx, encoder, nullptr) < 0) { compressed_encoder_close(e); return nullptr; }
+    e->frame_size = e->cctx->frame_size > 0 ? e->cctx->frame_size : 1024;
+
+    e->st = avformat_new_stream(e->fmt, nullptr);
+    if (!e->st || avcodec_parameters_from_context(e->st->codecpar, e->cctx) < 0) {
+        compressed_encoder_close(e); return nullptr;
+    }
+    e->st->time_base = e->cctx->time_base;
+
+    AVChannelLayout in_layout;
+    av_channel_layout_default(&in_layout, 1);
+    int r = swr_alloc_set_opts2(&e->swr,
+        &e->cctx->ch_layout, e->cctx->sample_fmt, e->cctx->sample_rate,
+        &in_layout, AV_SAMPLE_FMT_FLT, sample_rate, 0, nullptr);
+    av_channel_layout_uninit(&in_layout);
+    if (r < 0 || swr_init(e->swr) < 0) { compressed_encoder_close(e); return nullptr; }
+
+    e->fifo = av_audio_fifo_alloc(e->cctx->sample_fmt, e->cctx->ch_layout.nb_channels, 1);
+    e->frame = av_frame_alloc();
+    e->pkt = av_packet_alloc();
+    if (!e->fifo || !e->frame || !e->pkt) { compressed_encoder_close(e); return nullptr; }
+    e->frame->format = e->cctx->sample_fmt;
+    e->frame->sample_rate = e->cctx->sample_rate;
+    e->frame->nb_samples = e->frame_size;
+    av_channel_layout_copy(&e->frame->ch_layout, &e->cctx->ch_layout);
+    if (av_frame_get_buffer(e->frame, 0) < 0) { compressed_encoder_close(e); return nullptr; }
+
+    AVDictionary * mux_opts = nullptr;
+    if (codec == audio_codec::mp3) {
+        av_dict_set(&mux_opts, "write_xing", "0", 0);     // no xing tag => no seek
+        av_dict_set(&mux_opts, "id3v2_version", "0", 0);  // raw frames
+    }
+    r = avformat_write_header(e->fmt, &mux_opts);
+    av_dict_free(&mux_opts);
+    if (r < 0) { compressed_encoder_close(e); return nullptr; }
+    return e;
+}
+
+std::string compressed_encoder_write(compressed_encoder * e, const float * pcm, size_t n) {
+    if (!e) return {};
+    if (pcm && n > 0) {
+        const uint8_t * in_data[1] = { reinterpret_cast<const uint8_t *>(pcm) };
+        int out_max = (int)swr_get_out_samples(e->swr, (int)n);
+        if (out_max < (int)n) out_max = (int)n;
+        uint8_t ** conv = nullptr;
+        if (av_samples_alloc_array_and_samples(&conv, nullptr, e->cctx->ch_layout.nb_channels,
+                                               out_max, e->cctx->sample_fmt, 0) >= 0) {
+            int got = swr_convert(e->swr, conv, out_max, in_data, (int)n);
+            if (got > 0) av_audio_fifo_write(e->fifo, (void **)conv, got);
+            av_freep(&conv[0]);
+            av_freep(&conv);
+        }
+        libav_encode_fifo(e, false);
+    }
+    return take_pending(e);
+}
+
+std::string compressed_encoder_flush(compressed_encoder * e) {
+    if (!e) return {};
+    // drain any samples buffered inside the resampler, then encode + finalize.
+    int out_max = (int)swr_get_out_samples(e->swr, 0);
+    if (out_max > 0) {
+        uint8_t ** conv = nullptr;
+        if (av_samples_alloc_array_and_samples(&conv, nullptr, e->cctx->ch_layout.nb_channels,
+                                               out_max, e->cctx->sample_fmt, 0) >= 0) {
+            int got = swr_convert(e->swr, conv, out_max, nullptr, 0);
+            if (got > 0) av_audio_fifo_write(e->fifo, (void **)conv, got);
+            av_freep(&conv[0]);
+            av_freep(&conv);
+        }
+    }
+    libav_encode_fifo(e, true);
+    av_write_trailer(e->fmt);
+    return take_pending(e);
+}
+
+void compressed_encoder_close(compressed_encoder * e) {
+    if (!e) return;
+    if (e->frame) av_frame_free(&e->frame);
+    if (e->pkt)   av_packet_free(&e->pkt);
+    if (e->fifo)  av_audio_fifo_free(e->fifo);
+    if (e->swr)   swr_free(&e->swr);
+    if (e->cctx)  avcodec_free_context(&e->cctx);
+    if (e->fmt)   avformat_free_context(e->fmt);  // does not free custom pb
+    if (e->avio)  { av_freep(&e->avio->buffer); avio_context_free(&e->avio); }
+    delete e;
+}
+
+#else  // libav not compiled in: stubs so callers link regardless
+
+compressed_encoder * compressed_encoder_open(audio_codec, int) { return nullptr; }
+std::string compressed_encoder_write(compressed_encoder *, const float *, size_t) { return {}; }
+std::string compressed_encoder_flush(compressed_encoder *) { return {}; }
+void        compressed_encoder_close(compressed_encoder *) {}
+
+#endif // QWEN3_TTS_LIBAV
+
+std::string encode_compressed(audio_codec codec, const std::vector<float> & samples,
+                              int sample_rate) {
+    compressed_encoder * e = compressed_encoder_open(codec, sample_rate);
+    if (!e) return {};
+    std::string out = compressed_encoder_write(e, samples.data(), samples.size());
+    out += compressed_encoder_flush(e);
+    compressed_encoder_close(e);
+    return out;
+}
+
+// save_audio_file dispatches on the path extension: ".mp3"/".opus"/".ogg" emit
+// compressed audio, anything else emits 16-bit WAV.
+bool save_audio_file(const std::string & path, const std::vector<float> & samples,
+                     int sample_rate) {
+    std::string ext = get_file_extension(path);
+    audio_codec codec;
+    if (ext.size() > 1 && codec_from_name(ext.substr(1), codec)) {
+        const char * name = ext.c_str() + 1;
+        if (!compressed_audio_supported()) {
+            fprintf(stderr, "ERROR: %s output not supported by this build "
+                            "(rebuild with libav/ffmpeg dev libraries)\n", name);
+            return false;
+        }
+        std::string data = encode_compressed(codec, samples, sample_rate);
+        if (data.empty()) {
+            fprintf(stderr, "ERROR: %s encoding failed\n", name);
+            return false;
+        }
+        FILE * f = fopen(path.c_str(), "wb");
+        if (!f) {
+            fprintf(stderr, "ERROR: Cannot create file: %s\n", path.c_str());
+            return false;
+        }
+        fwrite(data.data(), 1, data.size(), f);
+        fclose(f);
+        return true;
+    }
+    return save_wav_file(path, samples, sample_rate);
 }
 
 } // namespace qwen3_tts

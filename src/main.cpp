@@ -12,7 +12,7 @@ void print_usage(const char * program) {
     fprintf(stderr, "  -m, --model <path>     Talker gguf file, or directory containing talker+tokenizer ggufs (required)\n");
     fprintf(stderr, "      --vocoder <file>   Tokenizer/vocoder gguf (required when -m is a file; else auto-discovered)\n");
     fprintf(stderr, "  -t, --text <text>      Text to synthesize (required)\n");
-    fprintf(stderr, "  -o, --output <file>    Output WAV file (default: output.wav)\n");
+    fprintf(stderr, "  -o, --output <file>    Output file; .wav, or .mp3/.opus if built with libav (default: output.wav)\n");
     fprintf(stderr, "  -r, --reference <file> Reference audio for voice cloning\n");
     fprintf(stderr, "  --temperature <val>    Sampling temperature (default: 0.9, 0=greedy)\n");
     fprintf(stderr, "  --top-k <n>            Top-k sampling (default: 50, 0=disabled)\n");

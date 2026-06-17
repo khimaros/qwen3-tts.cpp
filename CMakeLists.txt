@@ -27,6 +27,22 @@ endif()
 # Find threads
 find_package(Threads REQUIRED)
 
+# Optional compressed audio output (mp3, opus) via libav/ffmpeg. Auto-enabled
+# when the dev libraries are found; builds without them succeed and simply omit
+# the compressed formats at runtime.
+find_package(PkgConfig QUIET)
+if(PkgConfig_FOUND)
+    pkg_check_modules(LIBAV IMPORTED_TARGET
+        libavformat libavcodec libavutil libswresample)
+endif()
+if(LIBAV_FOUND)
+    set(QWEN3_TTS_LIBAV ON)
+    message(STATUS "compressed audio (mp3/opus): enabled (libavcodec ${LIBAV_libavcodec_VERSION})")
+else()
+    set(QWEN3_TTS_LIBAV OFF)
+    message(STATUS "compressed audio (mp3/opus): disabled (libav/ffmpeg not found)")
+endif()
+
 # Server dependencies (header-only, fetched at configure time)
 option(QWEN3_TTS_SERVER "Build the OpenAI-compatible TTS server" ON)
 if(QWEN3_TTS_SERVER)
@@ -153,6 +169,12 @@ target_link_libraries(qwen3_tts PUBLIC
     audio_tokenizer_decoder
     Threads::Threads
 )
+# compressed audio is a usage requirement: consumers (cli, server) inherit the
+# define and link transitively.
+if(QWEN3_TTS_LIBAV)
+    target_compile_definitions(qwen3_tts PUBLIC QWEN3_TTS_LIBAV)
+    target_link_libraries(qwen3_tts PUBLIC PkgConfig::LIBAV)
+endif()
 
 # Shared library with C API (for Nim FFI)
 add_library(qwen3tts_shared SHARED

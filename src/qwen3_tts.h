@@ -10,6 +10,7 @@
 #include <vector>
 #include <functional>
 #include <cstdint>
+#include <cstddef>
 
 namespace qwen3_tts {
 
@@ -235,11 +236,41 @@ private:
 };
 
 // Utility: Load audio file (WAV format)
-bool load_audio_file(const std::string & path, std::vector<float> & samples, 
+bool load_audio_file(const std::string & path, std::vector<float> & samples,
                      int & sample_rate);
 
-// Utility: Save audio file (WAV format)
+// Utility: Save audio file. Format is chosen by the path extension: ".mp3" and
+// ".opus"/".ogg" emit compressed audio (when compiled with libav), anything
+// else emits 16-bit WAV.
 bool save_audio_file(const std::string & path, const std::vector<float> & samples,
                      int sample_rate);
+
+// Compressed audio output (mp3, opus) via the optional libav/ffmpeg backend.
+// Default bitrates in bits/sec; opus is efficient so it targets a lower rate.
+enum class audio_codec { mp3, opus };
+constexpr int MP3_BITRATE  = 128000;
+constexpr int OPUS_BITRATE = 64000;
+
+// true when compressed-audio output was compiled in (libav found at build time)
+bool compressed_audio_supported();
+
+// Map a lowercase format or extension name ("mp3", "opus", "ogg") to a codec.
+// Returns false for names that are not a compressed audio format.
+bool codec_from_name(const std::string & name, audio_codec & out);
+
+// Encode float32 mono samples in [-1,1] to a complete container byte buffer
+// (mp3 frames, or ogg/opus). Empty on failure or when unsupported.
+std::string encode_compressed(audio_codec codec, const std::vector<float> & samples,
+                              int sample_rate);
+
+// Incremental encoder for streaming output. _open returns nullptr when
+// unsupported or init fails. Feed chunks with _write, finish with _flush (emits
+// trailing bytes), then _close. _write/_flush return container bytes ready for
+// the wire (possibly empty for a given chunk while the muxer buffers).
+struct compressed_encoder;
+compressed_encoder * compressed_encoder_open(audio_codec codec, int sample_rate);
+std::string compressed_encoder_write(compressed_encoder * enc, const float * pcm, size_t n);
+std::string compressed_encoder_flush(compressed_encoder * enc);
+void        compressed_encoder_close(compressed_encoder * enc);
 
 } // namespace qwen3_tts
