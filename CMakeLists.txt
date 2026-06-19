@@ -47,6 +47,11 @@ endif()
 option(QWEN3_TTS_SERVER "Build the OpenAI-compatible TTS server" ON)
 if(QWEN3_TTS_SERVER)
     include(FetchContent)
+
+    # Disable optional httplib dependencies to avoid linking failures
+    set(HTTPLIB_REQUIRE_ZSTD OFF CACHE BOOL "" FORCE)
+    set(HTTPLIB_REQUIRE_OPENSSL OFF CACHE BOOL "" FORCE)
+
     FetchContent_Declare(httplib
         GIT_REPOSITORY https://github.com/yhirose/cpp-httplib.git
         GIT_TAG        v0.20.0
@@ -64,6 +69,14 @@ set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 # GGML as subdirectory — options like GGML_VULKAN, GGML_METAL pass through automatically
 set(GGML_DIR "${CMAKE_CURRENT_SOURCE_DIR}/ggml")
 add_subdirectory(${GGML_DIR})
+
+# Set RPATH for Vulkan backend shared library so executables can find it at runtime
+if(GGML_VULKAN)
+    set_target_properties(ggml PROPERTIES
+        BUILD_RPATH "${CMAKE_BINARY_DIR}/ggml/src/ggml-vulkan"
+        INSTALL_RPATH "$ORIGIN"
+    )
+endif()
 
 # Text tokenizer library
 add_library(text_tokenizer STATIC
