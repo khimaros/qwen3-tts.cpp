@@ -1143,7 +1143,7 @@ struct compressed_encoder {
     int64_t           pts = 0;
 };
 
-static int libav_write_cb(void * opaque, const uint8_t * buf, int size) {
+static int libav_write_cb(void * opaque, uint8_t * buf, int size) {
     auto * e = static_cast<compressed_encoder *>(opaque);
     e->pending.append(reinterpret_cast<const char *>(buf), (size_t)size);
     return size;
@@ -1229,16 +1229,24 @@ compressed_encoder * compressed_encoder_open(audio_codec codec, int sample_rate)
     if (!e->cctx) { compressed_encoder_close(e); return nullptr; }
 
     // pick a sample format the encoder supports, preferring float.
-    const enum AVSampleFormat * sfmts = nullptr;
-    int n_sfmts = 0;
-    avcodec_get_supported_config(nullptr, encoder, AV_CODEC_CONFIG_SAMPLE_FORMAT, 0,
-                                 (const void **)&sfmts, &n_sfmts);
-    enum AVSampleFormat want = (sfmts && n_sfmts > 0) ? sfmts[0] : AV_SAMPLE_FMT_FLTP;
-    for (int i = 0; sfmts && i < n_sfmts; i++) {
-        if (sfmts[i] == AV_SAMPLE_FMT_FLT || sfmts[i] == AV_SAMPLE_FMT_FLTP) { want = sfmts[i]; break; }
+    {
+        enum AVSampleFormat want = AV_SAMPLE_FMT_FLTP;
+#if defined(AV_CODEC_CONFIG_SAMPLE_FORMAT)
+        int nfmts = avcodec_get_supported_config(nullptr, encoder, AV_CODEC_CONFIG_SAMPLE_FORMAT, 0,
+                                                  nullptr, nullptr);
+        if (nfmts > 0) {
+            std::vector<enum AVSampleFormat> sfmts(nfmts);
+            avcodec_get_supported_config(nullptr, encoder, AV_CODEC_CONFIG_SAMPLE_FORMAT, 0,
+                                          sfmts.data(), &nfmts);
+            want = sfmts[0];
+            for (int i = 0; i < nfmts; i++) {
+                if (sfmts[i] == AV_SAMPLE_FMT_FLT || sfmts[i] == AV_SAMPLE_FMT_FLTP) { want = sfmts[i]; break; }
+            }
+        }
+#endif
+        e->cctx->sample_fmt = want;
     }
 
-    e->cctx->sample_fmt  = want;
     e->cctx->sample_rate = sample_rate;
     av_channel_layout_default(&e->cctx->ch_layout, 1);  // mono
     e->cctx->bit_rate  = bitrate;
