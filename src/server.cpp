@@ -458,6 +458,25 @@ int main(int argc, char ** argv) {
 
     httplib::Server svr;
 
+    // CORS: allow cross-origin browser requests. OPTIONS preflight is handled
+    // here; other methods fall through to normal routing with CORS headers set.
+    svr.set_pre_routing_handler([](const httplib::Request & req, httplib::Response & res) {
+        auto origin = req.get_header_value("Origin");
+        if (!origin.empty()) {
+            res.set_header("Access-Control-Allow-Origin", origin);
+            res.set_header("Vary", "Origin");
+        }
+        res.set_header("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS");
+        res.set_header("Access-Control-Allow-Headers", "Content-Type, Authorization, Accept");
+        res.set_header("Access-Control-Max-Age", "86400");
+
+        if (req.method == "OPTIONS") {
+            res.status = 204;
+            return httplib::Server::HandlerResponse::Handled;
+        }
+        return httplib::Server::HandlerResponse::Unhandled;
+    });
+
     // log all requests
     svr.set_logger([](const httplib::Request & req, const httplib::Response & res) {
         fprintf(stderr, "%s %s%s%s -> %d\n",
